@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.datasets.manifest_dataset import AudioManifestDataset
+from src.datasets.samplers import make_task_balanced_sampler
 from src.losses.four_class import four_class_loss
 from src.losses.hierarchical import hierarchical_loss
 from src.losses.multitask import multitask_loss
@@ -19,7 +20,8 @@ from src.utils.io import ensure_dir
 log = logging.getLogger(__name__)
 
 
-def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle):
+def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
+                    balanced=False):
     ds = AudioManifestDataset(
         manifest_path=manifest,
         split=split,
@@ -28,10 +30,17 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle):
         sample_rate=44100,
         max_seconds=runtime_cfg["segment_seconds"],
     )
+    sampler = None
+    if balanced:
+        sampler = make_task_balanced_sampler(ds)
+        shuffle = False  # sampler and shuffle are mutually exclusive
+        log.info("Using balanced sampler for split=%s (%d samples)", split, len(ds))
+
     return DataLoader(
         ds,
         batch_size=runtime_cfg["batch_size"],
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=runtime_cfg["num_workers"],
     )
 
@@ -62,6 +71,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Model: %s | Trainable params: %s", model_cfg["name"], f"{param_count:,}")
 
+    use_balanced = runtime_cfg.get("balanced_sampling", True)
     train_loader = make_dataloader(
         manifest=manifest_path,
         split="train",
@@ -69,6 +79,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         datasets=experiment_cfg["train_datasets"],
         runtime_cfg=runtime_cfg,
         shuffle=True,
+        balanced=use_balanced,
     )
     val_loader = make_dataloader(
         manifest=manifest_path,

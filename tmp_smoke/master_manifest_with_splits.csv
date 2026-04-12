@@ -1,9 +1,0 @@
-filepath,track_id,source_dataset,split,auth_label,enc_label,class4_label,generator,encoder,duration
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_0.wav,track_0,SONICS,train,0,0,0,none,none,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_1.wav,track_0,FMA,train,0,1,1,none,encodec24,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_2.wav,track_1,SONICS,val,0,0,0,none,none,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_3.wav,track_1,FMA,val,0,1,1,none,encodec24,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_4.wav,track_2,SONICS,train,1,0,2,suno,none,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_5.wav,track_2,FMA,train,1,1,3,suno,encodec24,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_6.wav,track_3,SONICS,test,1,0,2,suno,none,1.0
-/Users/salmanqureshi/Desktop/Work/Study/MSC AI/Thesis/Code/ai-music-generalization/tmp_smoke/audio/sample_7.wav,track_3,FMA,test,1,1,3,suno,encodec24,1.0

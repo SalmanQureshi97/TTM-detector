@@ -9,3 +9,4 @@ segment_seconds: 30
 save_dir: outputs
 grad_clip: 1.0
 early_stopping_patience: 5
+balanced_sampling: true
