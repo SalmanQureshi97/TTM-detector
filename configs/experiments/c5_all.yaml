@@ -1,0 +1,37 @@
+name: c5_all
+notation: C5
+description: Full pooled training setup using FMA, SONICS, and FakeMusicCaps.
+study_question: Measures the strongest pooled detector and whether pooled training truly generalizes.
+train_datasets: [FMA, SONICS, FakeMusicCaps]
+val_datasets: [FMA, SONICS, FakeMusicCaps]
+available_suites: [S1, S2, S3, S4, S5, S6]
+test_suites:
+  - id: S1
+    name: in_domain_holdout
+    datasets: [FMA, SONICS, FakeMusicCaps]
+    split: test
+    purpose: Standard within-configuration holdout from the pooled training setup.
+  - id: S2
+    name: sonics_holdout
+    datasets: [SONICS]
+    split: test
+    purpose: SONICS-only held-out evaluation.
+  - id: S3
+    name: fma_fmc_holdout
+    datasets: [FMA, FakeMusicCaps]
+    split: test
+    purpose: Complementary real/fake holdout evaluation.
+  - id: S4
+    name: union_holdout
+    datasets: [FMA, SONICS, FakeMusicCaps]
+    split: test
+    purpose: Pooled unseen holdout across all known domains.
+advanced_suites:
+  - id: S5
+    name: generator_holdout
+    mode: requires_generator_specific_retraining
+    purpose: Hold out one generator family during training and test only on that family.
+  - id: S6
+    name: encoder_holdout
+    mode: requires_encoder_specific_retraining
+    purpose: Hold out one encoder family during training and test only on that encoder.

@@ -1,0 +1,4 @@
+name: authenticity_binary
+type: binary
+target: auth_label
+loss: bce

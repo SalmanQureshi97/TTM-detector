@@ -1,0 +1,4 @@
+name: encoding_binary
+type: binary
+target: enc_label
+loss: bce

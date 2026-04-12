@@ -1,0 +1,11 @@
+seed: 42
+batch_size: 8
+num_workers: 0
+epochs: 50
+learning_rate: 0.0001
+weight_decay: 0.0001
+device: cuda
+segment_seconds: 30
+save_dir: outputs
+grad_clip: 1.0
+early_stopping_patience: 5

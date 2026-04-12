@@ -1,0 +1,20 @@
+name: sonics_spectttra
+family: transformer
+frontend:
+  type: logmel
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 128
+  f_min: 0
+  f_max: 16000
+backbone:
+  type: spectttra
+  input_shape: [128, 768]
+  embed_dim: 512
+  t_clip: 3
+  f_clip: 5
+  num_heads: 8
+  num_layers: 6
+  pe_learnable: false
+  pre_norm: false

@@ -1,0 +1,9 @@
+name: hierarchical
+type: hierarchical
+targets:
+  auth: auth_label
+  enc: enc_label
+derived_target: class4_label
+loss:
+  auth_weight: 1.0
+  enc_weight: 1.0

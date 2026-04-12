@@ -1,0 +1,5 @@
+name: four_class_flat
+type: multiclass
+target: class4_label
+num_classes: 4
+loss: cross_entropy

@@ -1,0 +1,35 @@
+name: c1_sonics_only
+notation: C1
+description: Single-dataset full-task baseline trained only on SONICS.
+study_question: Measures transfer from a single end-to-end benchmark to external domains.
+train_datasets: [SONICS]
+val_datasets: [SONICS]
+available_suites: [S1, S2, S3, S4, S5, S6]
+test_suites:
+  - id: S1
+    name: in_domain_holdout
+    datasets: [SONICS]
+    split: test
+    purpose: Standard within-domain performance on held-out SONICS tracks.
+  - id: S3
+    name: fma_fmc_holdout
+    datasets: [FMA, FakeMusicCaps]
+    split: test
+    purpose: Transfer to the complementary real/fake domain made from FMA and FakeMusicCaps.
+  - id: S4
+    name: union_holdout
+    datasets: [FMA, SONICS, FakeMusicCaps]
+    split: test
+    purpose: Evaluate against the pooled test set across all known domains.
+advanced_suites:
+  - id: S2
+    name: sonics_holdout
+    note: Equivalent to S1 for C1 since training is SONICS-only.
+  - id: S5
+    name: generator_holdout
+    mode: requires_generator_specific_retraining
+    purpose: Hold out one generator family during training and test only on that family.
+  - id: S6
+    name: encoder_holdout
+    mode: requires_encoder_specific_retraining
+    purpose: Hold out one encoder family during training and test only on that encoder.

@@ -1,0 +1,15 @@
+name: generator_holdout
+notation: S5
+mode: generator_holdout
+holdout_field: generator
+description: Template for generator-holdout retraining runs.
+required_columns: [generator]
+train_split: train
+val_split: val
+test_split: test
+examples:
+  - suno
+  - udio
+  - MusicGen_medium
+  - audioldm2
+purpose: Hold out one generator during training and test only on that generator to measure transfer to unseen generation systems.

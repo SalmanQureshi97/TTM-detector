@@ -1,0 +1,37 @@
+name: c3_fma_sonics
+notation: C3
+description: Adds FMA real and real+encoded diversity to SONICS-based training.
+study_question: Measures whether real+encoded diversity improves transfer to unseen fake generators.
+train_datasets: [FMA, SONICS]
+val_datasets: [FMA, SONICS]
+available_suites: [S1, S2, S3, S4, S5, S6]
+test_suites:
+  - id: S1
+    name: in_domain_holdout
+    datasets: [FMA, SONICS]
+    split: test
+    purpose: Standard within-domain performance on the FMA + SONICS configuration.
+  - id: S2
+    name: sonics_holdout
+    datasets: [SONICS]
+    split: test
+    purpose: SONICS-only view for direct comparison with SONICS-native performance.
+  - id: S3
+    name: fakemusiccaps_holdout
+    datasets: [FakeMusicCaps]
+    split: test
+    purpose: Transfer to an external fake-only dataset with different generator families.
+  - id: S4
+    name: union_holdout
+    datasets: [FMA, SONICS, FakeMusicCaps]
+    split: test
+    purpose: Evaluate against the pooled test set across all known domains.
+advanced_suites:
+  - id: S5
+    name: generator_holdout
+    mode: requires_generator_specific_retraining
+    purpose: Hold out one generator family during training and test only on that family.
+  - id: S6
+    name: encoder_holdout
+    mode: requires_encoder_specific_retraining
+    purpose: Hold out one encoder family during training and test only on that encoder.

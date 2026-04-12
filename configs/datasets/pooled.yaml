@@ -1,0 +1,6 @@
+name: pooled
+source_dataset:
+  - FMA
+  - FakeMusicCaps
+  - SONICS
+description: Pooled dataset definition across all benchmark sources

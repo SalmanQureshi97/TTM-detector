@@ -1,0 +1,20 @@
+name: encoder_holdout
+notation: S6
+mode: encoder_holdout
+holdout_field: encoder
+description: Template for encoder-holdout retraining runs.
+required_columns: [encoder]
+train_split: train
+val_split: val
+test_split: test
+examples:
+  - encodec3
+  - encodec6
+  - encodec24
+  - griffin256
+  - griffin512
+  - lac2
+  - lac7
+  - lac14
+  - musika
+purpose: Hold out one encoder during training and test only on that encoder to measure transfer to unseen codec transformations.

@@ -1,0 +1,18 @@
+name: sonics_vit
+family: transformer
+frontend:
+  type: logmel
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 128
+  f_min: 0
+  f_max: 16000
+backbone:
+  type: vit
+  input_shape: [128, 768]
+  patch_size: 16
+  embed_dim: 512
+  num_heads: 8
+  num_layers: 6
+  pe_learnable: false
