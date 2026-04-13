@@ -143,6 +143,10 @@ def build_manifest(data_root, output_path):
             continue
         if file_path.suffix.lower() not in AUDIO_EXTENSIONS:
             continue
+        # Skip Jupyter checkpoint artifacts
+        if ".ipynb_checkpoints" in file_path.parts:
+            skipped += 1
+            continue
 
         try:
             top_folder = get_top_folder(file_path, data_root)
