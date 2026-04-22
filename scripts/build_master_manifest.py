@@ -20,7 +20,11 @@ Directory structure expected:
     │   └── *.mp3 / ...
     ├── sonics_fake/
     │   └── fake_<id>_<generator>_<variant>.mp3
-    └── sonics_fake_encoded/
+    ├── sonics_fake_encoded/
+    │   ├── encodec3/
+    │   ├── griffin256/
+    │   └── ...
+    └── sonics_real_encoded/
         ├── encodec3/
         ├── griffin256/
         └── ...
@@ -67,6 +71,11 @@ FOLDER_CONFIG = {
     "sonics_fake_encoded": {
         "source_dataset": "SONICS",
         "auth_label": 1,
+        "enc_label": 1,
+    },
+    "sonics_real_encoded": {
+        "source_dataset": "SONICS",
+        "auth_label": 0,
         "enc_label": 1,
     },
 }
@@ -183,9 +192,7 @@ def build_manifest(data_root, output_path):
             track_id = stem
 
         # --- Encoder ---
-        if top_folder == "fma_encoded":
-            encoder = get_subfolder(file_path, data_root, depth=1)
-        elif top_folder == "sonics_fake_encoded":
+        if top_folder in {"fma_encoded", "sonics_fake_encoded", "sonics_real_encoded"}:
             encoder = get_subfolder(file_path, data_root, depth=1)
         else:
             encoder = "none"
