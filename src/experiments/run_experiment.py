@@ -128,7 +128,8 @@ def move_target_to_device(target, device):
     return target.to(device)
 
 
-def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path):
+def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path,
+                 resume=False):
     device = torch.device(runtime_cfg["device"] if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
 
@@ -176,8 +177,26 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     epochs_without_improvement = 0
     history = {"epoch": [], "train_loss": [], "val_loss": [], "lr": []}
     limit_batches = runtime_cfg.get("limit_batches")  # cap steps/epoch for smoke tests; None = no cap
+    start_epoch = 1
 
-    for epoch in range(1, epochs + 1):
+    # --- Resume from last.pt (full training state) if requested ---
+    last_ckpt = out_dir / "last.pt"
+    if resume and last_ckpt.exists():
+        state = torch.load(last_ckpt, map_location=device)
+        model.load_state_dict(state["model_state"])
+        optimizer.load_state_dict(state["optimizer_state"])
+        if state.get("scheduler_state") is not None:
+            scheduler.load_state_dict(state["scheduler_state"])
+        start_epoch = state["epoch"] + 1
+        best_val = state.get("best_val", best_val)
+        epochs_without_improvement = state.get("epochs_without_improvement", 0)
+        history = state.get("history", history)
+        log.info("Resuming from %s: continuing at epoch %d (best_val=%.4f)",
+                 last_ckpt, start_epoch, best_val)
+    elif resume:
+        log.info("--resume set but no checkpoint at %s; starting fresh.", last_ckpt)
+
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
         # --- Train ---
@@ -252,6 +271,21 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
                 "  -> No improvement for %d epoch(s) (patience=%d)",
                 epochs_without_improvement, patience,
             )
+
+        # --- Resume checkpoint: full state, every epoch (overwrites) ---
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "val_loss": avg_val_loss,
+                "best_val": best_val,
+                "epochs_without_improvement": epochs_without_improvement,
+                "history": history,
+            },
+            last_ckpt,
+        )
 
         if epochs_without_improvement >= patience:
             log.info("Early stopping triggered after %d epochs.", epoch)

@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--runtime", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from outputs/.../last.pt if present.")
     return parser.parse_args()
 
 
@@ -38,7 +40,8 @@ def main():
     if args.num_workers is not None:
         runtime_cfg["num_workers"] = args.num_workers
     set_seed(runtime_cfg.get("seed", 42))
-    ckpt = run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, args.manifest)
+    ckpt = run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, args.manifest,
+                        resume=args.resume)
     print(f"Saved best checkpoint to {ckpt}")
 
 
