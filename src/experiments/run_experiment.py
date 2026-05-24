@@ -32,6 +32,22 @@ CLASS4_NAMES = ["real", "real_enc", "fake", "fake_enc"]
 log = logging.getLogger(__name__)
 
 
+def collate_batch(batch):
+    """Collate audio + target, but keep ``meta`` as a list of dicts.
+
+    The dataset returns a ``meta`` dict with string fields (filepath, track_id,
+    ...). PyTorch's default collate tries to tensor-ise every dict value and
+    fails on the strings, so we handle the three keys explicitly here.
+    """
+    audio = torch.stack([b["audio"] for b in batch])
+    targets = [b["target"] for b in batch]
+    if isinstance(targets[0], dict):
+        target = {k: torch.stack([t[k] for t in targets]) for k in targets[0]}
+    else:
+        target = torch.stack(targets)
+    return {"audio": audio, "target": target, "meta": [b["meta"] for b in batch]}
+
+
 def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
                     balanced=False, balance_subset=False, max_per_class=None):
     ds = AudioManifestDataset(
@@ -67,6 +83,7 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
         shuffle=shuffle,
         sampler=sampler,
         num_workers=runtime_cfg["num_workers"],
+        collate_fn=collate_batch,
     )
 
 
