@@ -1,27 +1,39 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
 
+import pandas as pd
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.datasets.manifest_dataset import AudioManifestDataset
-from src.datasets.samplers import make_task_balanced_sampler
+from src.datasets.samplers import (
+    balanced_subset_indices,
+    make_task_balanced_sampler,
+    task_balance_labels,
+)
+from src.evaluation.confusion import compute_confusion
+from src.evaluation.predict import collect_predictions
 from src.losses.four_class import four_class_loss
 from src.losses.hierarchical import hierarchical_loss
 from src.losses.multitask import multitask_loss
 from src.models.model_factory import UnifiedAudioModel
 from src.utils.io import ensure_dir
+from src.visualization.confusion_plot import plot_confusion
+from src.visualization.training_curves import plot_loss_curves
+
+CLASS4_NAMES = ["real", "real_enc", "fake", "fake_enc"]
 
 log = logging.getLogger(__name__)
 
 
 def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
-                    balanced=False):
+                    balanced=False, balance_subset=False, max_per_class=None):
     ds = AudioManifestDataset(
         manifest_path=manifest,
         split=split,
@@ -30,6 +42,19 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
         sample_rate=44100,
         max_seconds=runtime_cfg["segment_seconds"],
     )
+
+    if balance_subset:
+        # Downsample to equal per-class counts: a fixed, leakage-neutral
+        # balanced subset (used for the balanced validation set and for the
+        # train confusion-matrix inference).
+        labels = task_balance_labels(ds.df, task_cfg["type"])
+        idx = balanced_subset_indices(
+            labels, seed=runtime_cfg.get("seed", 42), max_per_class=max_per_class
+        )
+        ds.df = ds.df.iloc[idx].reset_index(drop=True)
+        shuffle = False
+        log.info("Balanced subset for split=%s: %d samples", split, len(ds))
+
     sampler = None
     if balanced:
         sampler = make_task_balanced_sampler(ds)
@@ -43,6 +68,29 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
         sampler=sampler,
         num_workers=runtime_cfg["num_workers"],
     )
+
+
+def _save_confusion(model, loader, task_cfg, device, out_dir, split_name):
+    """Run inference and persist a confusion matrix as PNG + CSV."""
+    task_type = task_cfg["type"]
+    y_true, y_pred = collect_predictions(model, loader, task_type, device)
+
+    if task_type == "multiclass":
+        labels = list(range(task_cfg.get("num_classes", 4)))
+        class_names = CLASS4_NAMES[: len(labels)]
+    else:  # binary
+        labels = [0, 1]
+        class_names = ["neg", "pos"]
+
+    cm = compute_confusion(y_true, y_pred, labels=labels)
+    pd.DataFrame(cm, index=class_names, columns=class_names).to_csv(
+        out_dir / f"confusion_{split_name}.csv"
+    )
+    plot_confusion(
+        cm, class_names, out_dir / f"confusion_{split_name}.png",
+        title=f"Confusion Matrix ({split_name})",
+    )
+    log.info("Saved confusion_%s.png / .csv (%d samples)", split_name, len(y_true))
 
 
 def compute_loss(task_cfg, outputs, targets):
@@ -88,6 +136,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         datasets=experiment_cfg["val_datasets"],
         runtime_cfg=runtime_cfg,
         shuffle=False,
+        balance_subset=runtime_cfg.get("balanced_val", False),
     )
     log.info("Train batches: %d | Val batches: %d", len(train_loader), len(val_loader))
 
@@ -108,6 +157,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
 
     best_val = float("inf")
     epochs_without_improvement = 0
+    history = {"epoch": [], "train_loss": [], "val_loss": [], "lr": []}
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -153,6 +203,11 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
             epoch, epochs, avg_train_loss, avg_val_loss, lr, elapsed,
         )
 
+        history["epoch"].append(epoch)
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(avg_val_loss)
+        history["lr"].append(lr)
+
         scheduler.step()
 
         # --- Checkpoint ---
@@ -181,4 +236,38 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
             break
 
     log.info("Training complete. Best val_loss=%.4f saved to %s", best_val, out_dir / "best.pt")
+
+    # --- Persist loss history (Req 6) ---
+    with open(out_dir / "history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    # --- Post-training reports: loss curves + confusion matrices (Req 5/6) ---
+    if runtime_cfg.get("make_reports", True):
+        plot_loss_curves(history, out_dir / "loss_curves.png")
+        log.info("Saved loss_curves.png")
+
+        task_type = task_cfg["type"]
+        ckpt_path = out_dir / "best.pt"
+        if task_type in {"binary", "multiclass"} and ckpt_path.exists():
+            # Reload best checkpoint so the matrices reflect the saved model.
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state"])
+
+            # Train confusion: balanced subset (optionally capped) for tractable inference.
+            train_eval_loader = make_dataloader(
+                manifest=manifest_path,
+                split="train",
+                task_cfg=task_cfg,
+                datasets=experiment_cfg["train_datasets"],
+                runtime_cfg=runtime_cfg,
+                shuffle=False,
+                balance_subset=True,
+                max_per_class=runtime_cfg.get("confusion_max_per_class"),
+            )
+            _save_confusion(model, train_eval_loader, task_cfg, device, out_dir, "train")
+            # Val confusion: reuse the balanced validation loader.
+            _save_confusion(model, val_loader, task_cfg, device, out_dir, "val")
+        else:
+            log.info("Skipping confusion matrices (task_type=%s)", task_type)
+
     return out_dir / "best.pt"

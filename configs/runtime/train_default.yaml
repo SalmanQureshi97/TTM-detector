@@ -10,3 +10,6 @@ save_dir: outputs
 grad_clip: 1.0
 early_stopping_patience: 5
 balanced_sampling: true
+balanced_val: true              # downsample val to equal counts across the 4 classes
+make_reports: true              # after training, emit loss curves + train/val confusion matrices
+confusion_max_per_class: null   # cap per-class rows for the train confusion matrix (null = use all)
