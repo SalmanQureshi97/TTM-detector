@@ -70,10 +70,10 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
     )
 
 
-def _save_confusion(model, loader, task_cfg, device, out_dir, split_name):
+def _save_confusion(model, loader, task_cfg, device, out_dir, split_name, max_batches=None):
     """Run inference and persist a confusion matrix as PNG + CSV."""
     task_type = task_cfg["type"]
-    y_true, y_pred = collect_predictions(model, loader, task_type, device)
+    y_true, y_pred = collect_predictions(model, loader, task_type, device, max_batches=max_batches)
 
     if task_type == "multiclass":
         labels = list(range(task_cfg.get("num_classes", 4)))
@@ -158,6 +158,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     best_val = float("inf")
     epochs_without_improvement = 0
     history = {"epoch": [], "train_loss": [], "val_loss": [], "lr": []}
+    limit_batches = runtime_cfg.get("limit_batches")  # cap steps/epoch for smoke tests; None = no cap
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -179,6 +180,8 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
             train_loss += loss.item()
             train_steps += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if limit_batches and train_steps >= limit_batches:
+                break
 
         avg_train_loss = train_loss / max(train_steps, 1)
 
@@ -193,6 +196,8 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
                 outputs = model(audio)
                 val_loss += compute_loss(task_cfg, outputs, target).item()
                 val_steps += 1
+                if limit_batches and val_steps >= limit_batches:
+                    break
 
         avg_val_loss = val_loss / max(val_steps, 1)
         elapsed = time.time() - t0
@@ -264,9 +269,11 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
                 balance_subset=True,
                 max_per_class=runtime_cfg.get("confusion_max_per_class"),
             )
-            _save_confusion(model, train_eval_loader, task_cfg, device, out_dir, "train")
+            _save_confusion(model, train_eval_loader, task_cfg, device, out_dir, "train",
+                            max_batches=limit_batches)
             # Val confusion: reuse the balanced validation loader.
-            _save_confusion(model, val_loader, task_cfg, device, out_dir, "val")
+            _save_confusion(model, val_loader, task_cfg, device, out_dir, "val",
+                            max_batches=limit_batches)
         else:
             log.info("Skipping confusion matrices (task_type=%s)", task_type)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 
-def collect_predictions(model, loader, task_type, device):
+def collect_predictions(model, loader, task_type, device, max_batches=None):
     """Run inference over a loader and return (y_true, y_pred) as numpy arrays.
 
     Supports the single-head classification tasks:
@@ -11,12 +11,15 @@ def collect_predictions(model, loader, task_type, device):
       - ``binary``: prediction = (sigmoid(logit) >= 0.5); truth = the binary target.
 
     Multitask/hierarchical tasks are not handled here (their outputs are dicts).
+    ``max_batches`` caps iterations (used for smoke tests); None = full loader.
     """
     model.eval()
     trues = []
     preds = []
     with torch.no_grad():
-        for batch in loader:
+        for step, batch in enumerate(loader):
+            if max_batches and step >= max_batches:
+                break
             audio = batch["audio"].to(device)
             target = batch["target"]
             outputs = model(audio)
