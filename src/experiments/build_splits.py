@@ -49,6 +49,11 @@ def assign_group_splits(
         raise ValueError(f"Missing group column: {group_col}")
 
     df = df.copy()
+    # track_id values are mixed-type across datasets (e.g. numeric SONICS fake
+    # ids like "36081" vs string stems like "real_00002"); pandas infers a
+    # mixed int/str column, which breaks np.unique sorting. Force to string so
+    # grouping and stratification are type-consistent.
+    df[group_col] = df[group_col].astype(str)
     df["split"] = ""
 
     # Build a track-level table: one row per unique track_id, with its
