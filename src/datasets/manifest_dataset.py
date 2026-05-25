@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +10,8 @@ import torchaudio
 from torch.utils.data import Dataset
 
 from src.datasets.label_builders import build_target
+
+log = logging.getLogger(__name__)
 
 
 class AudioManifestDataset(Dataset):
@@ -37,8 +41,7 @@ class AudioManifestDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+    def _process_row(self, row):
         audio, sr = torchaudio.load(Path(row["filepath"]))
         if sr != self.sample_rate:
             audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
@@ -56,3 +59,21 @@ class AudioManifestDataset(Dataset):
             "target": target,
             "meta": row.to_dict(),
         }
+
+    def __getitem__(self, idx):
+        # Some source files are corrupt / unreadable (e.g. ffmpeg "Invalid
+        # argument"). A single bad file must not crash the whole run, so on a
+        # load failure we log it and substitute another random sample. With a
+        # handful of bad files out of ~180k, the label distribution is
+        # unaffected.
+        cur = idx
+        for _ in range(10):
+            row = self.df.iloc[cur]
+            try:
+                return self._process_row(row)
+            except Exception as err:  # noqa: BLE001 - torchaudio raises RuntimeError/OSError
+                log.warning("Skipping unreadable file %s (%s)", row["filepath"], err)
+                cur = random.randrange(len(self.df))
+        raise RuntimeError(
+            f"Failed to load a valid sample after 10 attempts (started at idx {idx})"
+        )
