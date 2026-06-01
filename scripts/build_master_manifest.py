@@ -5,11 +5,19 @@ based on folder structure and filename conventions.
 
 Directory structure expected:
     data/
-    ├── FakeMusicCaps/
+    ├── fmc/                          # FakeMusicCaps (folder renamed from FakeMusicCaps/)
     │   ├── audioldm2/
     │   ├── musicgen_medium/
     │   ├── mustango/
     │   └── ...
+    ├── fmc_encoded/                  # FakeMusicCaps re-encoded (capped at 10k/codec)
+    │   ├── encodec3/
+    │   │   ├── audioldm2/
+    │   │   ├── musicgen_medium/
+    │   ├── encodec6/
+    │   ├── encodec24/
+    │   ├── griffin256/
+    │   └── griffin512/
     ├── fma_real/
     │   └── *.wav / *.mp3 / ...
     ├── fma_encoded/
@@ -29,6 +37,10 @@ Directory structure expected:
         ├── griffin256/
         └── ...
 
+The `source_dataset` label for both `fmc/` and `fmc_encoded/` is kept as
+"FakeMusicCaps" so existing experiment/dataset YAML configs (which filter
+on `source_dataset == "FakeMusicCaps"`) keep working without changes.
+
 Usage:
     python scripts/build_master_manifest.py \
         --data-root /home/jovyan/Thesis/Code/data \
@@ -43,10 +55,15 @@ from pathlib import Path
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
 FOLDER_CONFIG = {
-    "FakeMusicCaps": {
+    "fmc": {
         "source_dataset": "FakeMusicCaps",
         "auth_label": 1,
         "enc_label": 0,
+    },
+    "fmc_encoded": {
+        "source_dataset": "FakeMusicCaps",
+        "auth_label": 1,
+        "enc_label": 1,
     },
     "fma_real": {
         "source_dataset": "FMA",
@@ -134,7 +151,8 @@ def get_subfolder(path, data_root, depth=1):
     """Get the subfolder at a given depth relative to the top-level folder.
 
     For data_root/fma_encoded/encodec3/track.wav with depth=1, returns 'encodec3'.
-    For data_root/FakeMusicCaps/audioldm2/track.wav with depth=1, returns 'audioldm2'.
+    For data_root/fmc/audioldm2/track.wav with depth=1, returns 'audioldm2'.
+    For data_root/fmc_encoded/encodec3/audioldm2/track.wav with depth=2, returns 'audioldm2'.
     """
     rel_parts = path.relative_to(data_root).parts
     if len(rel_parts) > depth:
@@ -182,9 +200,16 @@ def build_manifest(data_root, output_path):
             # the fake_<id>_<generator>_<variant> convention
             generator = extract_generator_from_sonics_filename(stem)
             track_id = extract_track_id_from_sonics(stem)
-        elif top_folder == "FakeMusicCaps":
+        elif top_folder == "fmc":
             # Generator is the subfolder name (e.g., audioldm2, musicgen_medium)
             generator = get_subfolder(file_path, data_root, depth=1)
+            track_id = stem
+        elif top_folder == "fmc_encoded":
+            # Layout: fmc_encoded/<encoder>/<generator>/<file>
+            # The encoder lives at depth=1 and the generator at depth=2,
+            # so the encoded variant inherits the same generator and the
+            # same track_id (stem) as its fmc/ source for group-safe splits.
+            generator = get_subfolder(file_path, data_root, depth=2)
             track_id = stem
         else:
             # Real audio (FMA, SONICS real)
@@ -192,7 +217,8 @@ def build_manifest(data_root, output_path):
             track_id = stem
 
         # --- Encoder ---
-        if top_folder in {"fma_encoded", "sonics_fake_encoded", "sonics_real_encoded"}:
+        if top_folder in {"fma_encoded", "sonics_fake_encoded",
+                          "sonics_real_encoded", "fmc_encoded"}:
             encoder = get_subfolder(file_path, data_root, depth=1)
         else:
             encoder = "none"
