@@ -1,0 +1,5 @@
+,real,real_enc,fake,fake_enc
+real,4170,0,1,0
+real_enc,2,4126,0,43
+fake,2,0,4169,0
+fake_enc,0,68,0,4103
