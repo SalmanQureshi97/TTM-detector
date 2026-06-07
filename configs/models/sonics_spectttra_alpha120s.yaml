@@ -1,0 +1,38 @@
+name: sonics_spectttra_alpha120s
+family: transformer
+
+# Mirrors the SONICS upstream config.json for the ALPHA-120s pretrained model.
+# Used together with configs/runtime/train_spectttra.yaml (16 kHz, 120 s segments,
+# AMP) and a manifest that has been split-aligned to SONICS' official partition
+# via scripts/align_sonics_splits.py (otherwise the model is evaluated on data
+# it has already seen during pretraining).
+
+frontend:
+  type: logmel
+  sample_rate: 16000
+  n_fft: 2048
+  hop_length: 512
+  win_length: 2048
+  n_mels: 128
+  f_min: 20
+  f_max: 8000
+  power: 2
+  top_db: 80
+  norm: mean_std        # per-sample (mean, std) normalization on the dB-mel
+
+backbone:
+  type: spectttra
+  pretrained_weights: pretrained/sonics-spectttra-alpha-120s.bin
+  freeze: true          # train head only first; flip to false for full fine-tune
+  input_shape: [128, 3744]
+  embed_dim: 384
+  num_heads: 6
+  num_layers: 12
+  t_clip: 3
+  f_clip: 1
+  mlp_ratio: 2.67
+  pe_learnable: true
+  pre_norm: true
+  attn_drop_rate: 0.1
+  pos_drop_rate: 0.1
+  proj_drop_rate: 0.0

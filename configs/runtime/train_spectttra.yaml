@@ -1,0 +1,29 @@
+seed: 42
+
+# SpecTTTra ALPHA-120s preprocessing: 16 kHz, 120 s windows.
+sample_rate: 16000
+segment_seconds: 120
+
+# Memory: 120 s of audio + 12 transformer layers is heavy. With a frozen
+# backbone and AMP on an A40, batch 4 is the safe starting point. Try 8
+# if `nvidia-smi` shows comfortable headroom after the first epoch.
+batch_size: 4
+num_workers: 4
+amp: true
+
+# Optimisation. Head-only training converges fast; full fine-tune needs
+# patience. Keep cosine + early stopping as for SpecCNN.
+epochs: 50
+learning_rate: 0.0005          # close to the SONICS upstream lr_base
+weight_decay: 0.05
+grad_clip: 5.0
+early_stopping_patience: 5
+device: cuda
+save_dir: outputs
+
+# Class balancing identical to the SpecCNN run.
+balanced_sampling: true
+balanced_val: true
+make_reports: true
+confusion_max_per_class: null
+limit_batches: null

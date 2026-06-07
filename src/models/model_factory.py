@@ -24,6 +24,10 @@ class UnifiedAudioModel(nn.Module):
                 n_mels=frontend_cfg["n_mels"],
                 f_min=frontend_cfg.get("f_min", 0),
                 f_max=frontend_cfg.get("f_max", 16000),
+                win_length=frontend_cfg.get("win_length"),
+                power=frontend_cfg.get("power", 2.0),
+                top_db=frontend_cfg.get("top_db", 80.0),
+                norm=frontend_cfg.get("norm"),
             )
         elif frontend_cfg["type"] == "deezer_amplitude":
             self.frontend = DeezerAmplitudeFrontend(

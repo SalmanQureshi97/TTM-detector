@@ -55,7 +55,7 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
         split=split,
         task_cfg=task_cfg,
         dataset_filter=datasets,
-        sample_rate=44100,
+        sample_rate=runtime_cfg.get("sample_rate", 44100),
         max_seconds=runtime_cfg["segment_seconds"],
     )
 
@@ -134,8 +134,14 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     log.info("Device: %s", device)
 
     model = UnifiedAudioModel(model_cfg, task_cfg).to(device)
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Model: %s | Trainable params: %s", model_cfg["name"], f"{param_count:,}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    log.info("Model: %s | Trainable params: %s / %s total",
+             model_cfg["name"], f"{trainable:,}", f"{total:,}")
+
+    # Audio loader uses the frontend's sample rate (e.g. 16k for SpecTTTra-120s).
+    runtime_cfg.setdefault("sample_rate",
+                           model_cfg.get("frontend", {}).get("sample_rate", 44100))
 
     use_balanced = runtime_cfg.get("balanced_sampling", True)
     train_loader = make_dataloader(
@@ -168,6 +174,13 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     grad_clip = runtime_cfg.get("grad_clip", 1.0)
     patience = runtime_cfg.get("early_stopping_patience", 5)
+
+    # Mixed precision: fp16 forward/backward roughly halves activation memory
+    # and speeds up matmul/conv on Ampere. No-op when amp=false or on CPU.
+    use_amp = bool(runtime_cfg.get("amp", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        log.info("AMP enabled (fp16 autocast + GradScaler)")
 
     out_dir = ensure_dir(
         Path(runtime_cfg["save_dir"]) / experiment_cfg["name"] / model_cfg["name"] / task_cfg["name"]
@@ -205,14 +218,17 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         train_steps = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [train]", leave=False)
         for batch in pbar:
-            audio = batch["audio"].to(device)
+            audio = batch["audio"].to(device, non_blocking=True)
             target = move_target_to_device(batch["target"], device)
             optimizer.zero_grad()
-            outputs = model(audio)
-            loss = compute_loss(task_cfg, outputs, target)
-            loss.backward()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(audio)
+                loss = compute_loss(task_cfg, outputs, target)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item()
             train_steps += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -227,10 +243,12 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         val_steps = 0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [val]", leave=False):
-                audio = batch["audio"].to(device)
+                audio = batch["audio"].to(device, non_blocking=True)
                 target = move_target_to_device(batch["target"], device)
-                outputs = model(audio)
-                val_loss += compute_loss(task_cfg, outputs, target).item()
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(audio)
+                    loss = compute_loss(task_cfg, outputs, target)
+                val_loss += loss.item()
                 val_steps += 1
                 if limit_batches and val_steps >= limit_batches:
                     break
