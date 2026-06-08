@@ -2,14 +2,23 @@
 
 Why: the SpecTTTra ALPHA-120s checkpoint was pretrained on SONICS using a specific
 train/val/test partition. If we evaluate the model on any SONICS row it has already
-seen during pretraining, that's leakage. This script aligns the ``split`` column for
-every SONICS row in our manifest to the SONICS-official split (looked up by the
-basename of the audio file). FMA and FakeMusicCaps rows are left untouched -- the
-SpecTTTra backbone never saw them, so our group-aware splits are fine.
+seen during pretraining, that's leakage. This script aligns the ``split`` column
+**at the file level** for every SONICS row in our manifest, looking up the
+SONICS-official split by the basename of the audio file. FMA and FakeMusicCaps
+rows are left untouched -- the SpecTTTra backbone never saw them, so our
+group-aware splits are fine.
 
 Encoded variants (``sonics_real_encoded``, ``sonics_fake_encoded``) inherit the
 SONICS-official split through filename matching -- the stem of an encoded file is
 identical to its source's stem.
+
+Note on track_id grouping: SONICS may split variants of the same logical song
+(e.g. ``fake_36081_udio_0`` vs ``fake_36081_udio_1``) into different splits. Our
+original ``assign_group_splits`` grouped all variants by ``track_id``. After this
+alignment, a SONICS ``track_id`` may span multiple splits -- this is by design,
+because the correct leakage invariant for a SONICS-pretrained backbone is
+**file-level** (every file in our val/test must be a file SpecTTTra never saw),
+not track-level. FMA/FMC rows retain their track-grouped splits.
 
 Usage:
     python scripts/align_sonics_splits.py \\
@@ -59,27 +68,17 @@ def _build_official_map(paths_by_split, filename_col):
     return mapping
 
 
-def _resolve_track_conflicts(df):
-    """Force every track_id to a single split (majority vote).
+def _report_track_conflicts(df):
+    """Count SONICS track_ids whose variants now land in >1 split.
 
-    Encoded variants of a track must end up in the same split as the
-    track's source. Since encoded files inherit the source's stem and
-    therefore the same SONICS-official split, conflicts here would be
-    rare -- but the resolver guarantees the invariant either way.
+    We **do not** resolve these. SONICS-official splits operate at the file
+    level; forcing variants of a track into a single split (e.g. by majority
+    vote) could move a file SpecTTTra saw during pretraining into our val/test
+    -- the dangerous direction of leakage. Spans are logged for transparency.
     """
-    spans = df.groupby("track_id")["split"].nunique()
-    conflicted = int((spans > 1).sum())
-    if conflicted == 0:
-        return df, 0
-
-    def majority(splits):
-        c = Counter(splits.tolist())
-        return c.most_common(1)[0][0]
-
-    track_split = df.groupby("track_id")["split"].apply(majority)
-    df = df.copy()
-    df["split"] = df["track_id"].map(track_split)
-    return df, conflicted
+    son = df[df["source_dataset"] == "SONICS"]
+    spans = son.groupby("track_id")["split"].nunique()
+    return int((spans > 1).sum())
 
 
 def main():
@@ -115,19 +114,32 @@ def main():
         )
         print(f"  sample unmatched stems: {sample}")
 
-    # Override split for SONICS rows that we could match.
+    # Override split for SONICS rows that we could match -- at the FILE level.
     overridden_split = m.loc[sonics_mask & matched, "_stem"].map(official_map)
     m.loc[sonics_mask & matched, "split"] = overridden_split.values
 
-    # Resolve any track_ids that now span >1 split (shouldn't happen, but verify).
-    m, conflicted = _resolve_track_conflicts(m)
-    if conflicted:
-        print(f"  resolved {conflicted} track_id split conflicts by majority vote.")
+    # Information: how many SONICS track_ids now span more than one split.
+    # We deliberately do NOT resolve this; see module docstring.
+    sonics_spans = _report_track_conflicts(m)
+    print(f"  SONICS track_ids spanning multiple splits (expected, file-level alignment): {sonics_spans}")
 
-    spans = m.groupby("track_id")["split"].nunique()
-    if not (spans == 1).all():
-        raise RuntimeError("Leakage check failed: some track_ids still span >1 split.")
-    print(f"  leakage check (one split per track_id): True")
+    # Verify SONICS rows are file-level aligned with the SONICS-official map.
+    son = m[sonics_mask].copy()
+    son["_official"] = son["_stem"].map(official_map)
+    aligned_ok = bool((son["split"] == son["_official"]).all())
+    if not aligned_ok:
+        raise RuntimeError("SpecTTTra leakage check failed: a SONICS row's split "
+                           "does not match the SONICS-official split.")
+    print(f"  SpecTTTra leakage check (every SONICS file == SONICS-official split): True")
+
+    # Verify FMA / FakeMusicCaps still respect track-grouped splits (their original invariant).
+    non_son = m[~sonics_mask]
+    non_son_spans = non_son.groupby("track_id")["split"].nunique()
+    fma_fmc_ok = bool((non_son_spans == 1).all())
+    if not fma_fmc_ok:
+        print(f"  WARNING: {int((non_son_spans>1).sum())} non-SONICS track_ids span >1 split.")
+    else:
+        print(f"  FMA/FMC group invariant (one split per track_id outside SONICS): True")
 
     m = m.drop(columns=["_stem"])
 
