@@ -1,0 +1,26 @@
+seed: 42
+
+# Same audio params as the full SpecTTTra config (must match the pretrained
+# checkpoint's expected input).
+sample_rate: 16000
+segment_seconds: 120
+
+# Smoke-test scale: a couple of capped epochs, just to confirm all six
+# artifacts generate and the pretrained loader hooked up correctly.
+batch_size: 4
+num_workers: 4
+amp: true
+epochs: 2
+limit_batches: 20
+confusion_max_per_class: 200
+
+learning_rate: 0.0005
+weight_decay: 0.05
+grad_clip: 5.0
+early_stopping_patience: 5
+device: cuda
+save_dir: outputs
+
+balanced_sampling: true
+balanced_val: true
+make_reports: true
