@@ -78,9 +78,13 @@ class UnifiedAudioModel(nn.Module):
             raise ValueError(f"Unsupported task_type={task_cfg['type']}")
 
     def forward(self, audio):
-        spec = self.frontend(audio)
-        spec = spec.unsqueeze(1)
-        if self.resize_to is not None:
-            spec = F.interpolate(spec, size=self.resize_to, mode="bilinear")
+        # Frontend (mel + dB + mean/std reductions) is numerically fragile in
+        # fp16 -- forcing it to fp32 prevents NaNs from log/std under AMP.
+        # The backbone+head still benefit from the outer autocast.
+        with torch.cuda.amp.autocast(enabled=False):
+            spec = self.frontend(audio.float())
+            spec = spec.unsqueeze(1)
+            if self.resize_to is not None:
+                spec = F.interpolate(spec, size=self.resize_to, mode="bilinear")
         embedding = self.backbone(spec)
         return self.head(embedding)
