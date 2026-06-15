@@ -145,7 +145,7 @@ class GradCAM:
         weights = gradients.mean(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
         cam = (weights * activations).sum(dim=1, keepdim=True)  # [B, 1, H, W]
         cam = F.relu(cam)
-        cam = cam[0, 0].cpu().numpy()
+        cam = cam[0, 0].detach().cpu().numpy()
         # Normalise
         cmin, cmax = cam.min(), cam.max()
         if cmax - cmin > 1e-8:
@@ -163,7 +163,7 @@ class GradCAM:
         """
         # activations, gradients: [B, N, D]
         importance = (gradients * activations).abs().mean(dim=-1)  # [B, N]
-        weights = importance[0].cpu().numpy()
+        weights = importance[0].detach().cpu().numpy()
 
         if self.mapper is not None:
             # Truncate or pad if token count doesn't match exactly
