@@ -1,5 +1,5 @@
 ,real,real_enc,fake,fake_enc
-real,1185,55,1,2
-real_enc,144,1084,0,15
-fake,144,314,617,168
-fake_enc,36,257,56,894
+real,1205,29,1,8
+real_enc,192,1026,0,25
+fake,181,157,617,288
+fake_enc,73,162,51,957
