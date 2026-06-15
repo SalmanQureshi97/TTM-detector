@@ -90,6 +90,13 @@ class GradCAM:
 
         device = next(self.model.parameters()).device
         audio = audio.to(device)
+        # Required when the backbone is frozen (e.g. SpecTTTra linear probe):
+        # if no parameter in the forward path has requires_grad=True, all
+        # activations downstream also lack grad and the GradientExtractor
+        # hooks cannot retain_grad. Marking the input as requiring grad
+        # builds the autograd graph through the frozen weights via the
+        # chain rule -- we only need activation gradients, not weight ones.
+        audio = audio.requires_grad_(True)
 
         self.model.zero_grad()
         grad_ext = GradientExtractor(self.model, [self.target_layer])
