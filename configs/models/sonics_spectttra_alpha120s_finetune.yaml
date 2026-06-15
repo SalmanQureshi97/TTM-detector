@@ -1,0 +1,37 @@
+name: sonics_spectttra_alpha120s_finetune
+family: transformer
+
+# Full fine-tune: unfreeze the SpecTTTra backbone so all 18.7M params train.
+# Pair with configs/runtime/train_spectttra_finetune.yaml (smaller batch +
+# lower learning rate so the pretrained features aren't smashed by aggressive
+# gradients on the first few steps).
+
+frontend:
+  type: logmel
+  sample_rate: 16000
+  n_fft: 2048
+  hop_length: 512
+  win_length: 2048
+  n_mels: 128
+  f_min: 20
+  f_max: 8000
+  power: 2
+  top_db: 80
+  norm: mean_std
+
+backbone:
+  type: spectttra
+  pretrained_weights: pretrained/sonics-spectttra-alpha-120s.bin
+  freeze: false                 # full fine-tune
+  input_shape: [128, 3744]
+  embed_dim: 384
+  num_heads: 6
+  num_layers: 12
+  t_clip: 3
+  f_clip: 1
+  mlp_ratio: 2.67
+  pe_learnable: true
+  pre_norm: true
+  attn_drop_rate: 0.1
+  pos_drop_rate: 0.1
+  proj_drop_rate: 0.0

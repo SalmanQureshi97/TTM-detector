@@ -1,0 +1,30 @@
+seed: 42
+
+# Audio params must match the pretrained SpecTTTra (16 kHz, 120 s windows).
+sample_rate: 16000
+segment_seconds: 120
+
+# Full fine-tune is heavier than the frozen run: 18.7M params now have
+# gradients + Adam momentum/variance tensors. AMP is mandatory; start
+# with batch 2 and bump to 4 if `nvidia-smi` shows headroom.
+batch_size: 2
+num_workers: 4
+amp: true
+
+# Lower learning rate is the key knob -- a high LR on the head with the
+# backbone unfrozen will tear apart SONICS' pretrained features in the
+# first few steps and the model will collapse. 5e-5 is a safe starting
+# point; raise if val loss is descending too slowly.
+epochs: 50
+learning_rate: 0.00005
+weight_decay: 0.05
+grad_clip: 5.0
+early_stopping_patience: 5
+device: cuda
+save_dir: outputs
+
+balanced_sampling: true
+balanced_val: true
+make_reports: true
+confusion_max_per_class: null
+limit_batches: null

@@ -68,10 +68,16 @@ class UnifiedAudioModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone={backbone_cfg['type']}")
 
+        head_cfg = model_cfg.get("head", {}) or {}
         if task_cfg["type"] == "binary":
             self.head = BinaryHead(out_dim)
         elif task_cfg["type"] == "multiclass":
-            self.head = FourClassHead(out_dim, task_cfg.get("num_classes", 4))
+            self.head = FourClassHead(
+                out_dim,
+                num_classes=task_cfg.get("num_classes", 4),
+                hidden_dim=head_cfg.get("hidden_dim"),
+                dropout=head_cfg.get("dropout", 0.0),
+            )
         elif task_cfg["type"] in {"multitask", "hierarchical"}:
             self.head = MultiTaskHead(out_dim)
         else:
