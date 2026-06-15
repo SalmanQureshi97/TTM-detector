@@ -180,14 +180,24 @@ def main():
     fe = model_cfg["frontend"]
     sample_rate = fe["sample_rate"]
     hop_length = fe.get("hop_length", 512)
-    n_mels = fe.get("n_mels", 128)
-    f_min = fe.get("f_min", 0)
-    f_max = fe.get("f_max", sample_rate // 2)
     max_seconds = rt.get("segment_seconds", 30)
 
-    freq_bins = np.arange(n_mels)
-    # max_seconds is the model input window; the actual #frames may differ a
-    # bit, but for centre-of-mass on the time axis we just use frame indices.
+    # The heatmap's frequency dimension comes from the actual spectrogram
+    # shape, which depends on the frontend type (mel banks vs. STFT bins
+    # capped at hf_cut). f_min/f_max are taken per-frontend:
+    if fe["type"] == "logmel":
+        freq_min_hz = fe.get("f_min", 0)
+        freq_max_hz = fe.get("f_max", sample_rate // 2)
+    elif fe["type"] == "deezer_amplitude":
+        freq_min_hz = 0
+        freq_max_hz = fe.get("hf_cut", sample_rate // 2)
+    else:
+        freq_min_hz = 0
+        freq_max_hz = sample_rate // 2
+
+    # The actual F (number of frequency bins in the spectrogram / heatmap) is
+    # determined at runtime from the first successful sample's heatmap shape.
+    # We'll build the Hz axis lazily once we know F.
 
     # --- Slices --------------------------------------------------------------
     # (label, source_dataset, class4, target_class_for_cam)
@@ -266,19 +276,23 @@ def main():
         per_slice_freq_profiles[slice_name] = freq_arr
         per_slice_time_profiles[slice_name] = time_arr
 
+        # Build the Hz axis from the actual frequency dimension F of this
+        # slice's averaged profile. F equals the spectrogram's frequency
+        # axis (e.g. 128 for log-mel, ~743 for Deezer-amplitude at 16 kHz
+        # hf_cut with 44.1 kHz / n_fft=2048).
+        F = len(freq_arr)
+        hz_axis = np.linspace(freq_min_hz, freq_max_hz, F)
+
         peak_bin = int(freq_arr.argmax())
-        peak_hz = mel_bin_to_hz(peak_bin, n_mels, f_min, f_max)
+        peak_hz = float(hz_axis[peak_bin])
         rows.append({
             "slice": slice_name,
             "n_samples": len(freq_profs),
             "H_freq_nats": entropy(freq_arr),
-            "H_freq_pct_of_max": entropy(freq_arr) / np.log(len(freq_arr)),
-            "peak_mel_bin": peak_bin,
+            "H_freq_pct_of_max": entropy(freq_arr) / np.log(F),
+            "peak_freq_bin": peak_bin,
             "peak_freq_hz": peak_hz,
-            "freq_center_of_mass_hz": center_of_mass(
-                freq_arr, np.array([mel_bin_to_hz(b, n_mels, f_min, f_max)
-                                    for b in freq_bins])
-            ),
+            "freq_center_of_mass_hz": center_of_mass(freq_arr, hz_axis),
             "H_time_nats": entropy(time_arr),
             "H_time_pct_of_max": entropy(time_arr) / np.log(len(time_arr)),
             "time_center_of_mass_frame": center_of_mass(
@@ -315,10 +329,8 @@ def main():
 
     # --- Summary plot (frequency profiles + time profiles, side-by-side) ----
     fig, axes = plt.subplots(2, 1, figsize=(11, 7))
-    hz_axis = np.array(
-        [mel_bin_to_hz(b, n_mels, f_min, f_max) for b in freq_bins]
-    )
     for name, prof in per_slice_freq_profiles.items():
+        hz_axis = np.linspace(freq_min_hz, freq_max_hz, len(prof))
         axes[0].plot(hz_axis, prof, label=name)
     axes[0].set_xlabel("Approx. frequency (Hz)")
     axes[0].set_ylabel("Normalised attention")
