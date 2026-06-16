@@ -1,0 +1,36 @@
+name: deezer_speccnn_amplitude_specaug
+family: cnn
+
+# Identical architecture to deezer_speccnn_amplitude.yaml; the only
+# addition is the SpecAugment block. The frontend params and backbone
+# block mirror the canonical config exactly so cross-comparison runs are
+# apples-to-apples.
+
+frontend:
+  type: deezer_amplitude
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  hf_cut: 16000
+  normalize_mean: -4.0
+  normalize_std: 3.0
+
+backbone:
+  type: speccnn
+  channels: [128, 128, 256, 256, 512, 512]
+  strides: [1, 3, 3, 3, 3, 3]
+  kernel_sizes: [3, 3, 3, 3, 3, 3]
+  head_dim: 64
+
+augment:
+  type: spec_augment
+  # The deezer-amplitude spectrogram is ~743 freq bins x ~2580 time frames
+  # (44.1 kHz, hop 512, 30 s, hf_cut 16 kHz). Scale the mask widths up
+  # relative to the SpecTTTra log-mel because the frequency axis is ~6x
+  # larger.
+  freq_mask_param: 80        # up to 80 / 743 ~= 11% of the frequency axis per mask
+  n_freq_masks: 2
+  time_mask_param: 200       # up to 200 / 2580 ~= 7.8% of the time axis per mask
+  n_time_masks: 2
+  p: 1.0
+  mask_value: 0.0            # 0 is the mean after the frontend's normalize step

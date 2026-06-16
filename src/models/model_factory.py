@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from src.features.deezer_frontend import DeezerAmplitudeFrontend
 from src.features.logmel import LogMelFrontend
+from src.features.spec_augment import SpecAugment
 from src.models.heads.binary_head import BinaryHead
 from src.models.heads.four_class_head import FourClassHead
 from src.models.heads.multitask_head import MultiTaskHead
@@ -77,6 +78,21 @@ class UnifiedAudioModel(nn.Module):
         else:
             raise ValueError(f"Unsupported task_type={task_cfg['type']}")
 
+        # Optional SpecAugment between the frontend (+ resize) and the
+        # backbone. Active only during training; no-op at eval.
+        aug_cfg = model_cfg.get("augment") or {}
+        if aug_cfg.get("type") == "spec_augment":
+            self.spec_augment = SpecAugment(
+                freq_mask_param=aug_cfg.get("freq_mask_param", 27),
+                n_freq_masks=aug_cfg.get("n_freq_masks", 2),
+                time_mask_param=aug_cfg.get("time_mask_param", 100),
+                n_time_masks=aug_cfg.get("n_time_masks", 2),
+                p=aug_cfg.get("p", 1.0),
+                mask_value=aug_cfg.get("mask_value", 0.0),
+            )
+        else:
+            self.spec_augment = None
+
     def forward(self, audio):
         # Frontend (mel + dB + mean/std reductions) is numerically fragile in
         # fp16 -- forcing it to fp32 prevents NaNs from log/std under AMP.
@@ -86,5 +102,9 @@ class UnifiedAudioModel(nn.Module):
             spec = spec.unsqueeze(1)
             if self.resize_to is not None:
                 spec = F.interpolate(spec, size=self.resize_to, mode="bilinear")
+            # SpecAugment masks the final input to the backbone. Only fires
+            # in training mode; safely skipped otherwise.
+            if self.spec_augment is not None:
+                spec = self.spec_augment(spec)
         embedding = self.backbone(spec)
         return self.head(embedding)

@@ -1,0 +1,49 @@
+name: sonics_spectttra_alpha120s_specaug
+family: transformer
+
+# Same backbone + frontend as sonics_spectttra_alpha120s.yaml; the only
+# addition is a SpecAugment block applied after the log-mel frontend.
+# Defaults below scale the magnitudes to the SpecTTTra-120s input
+# geometry: 128 mel bins x ~3744 time frames (16 kHz, 120 s window).
+
+frontend:
+  type: logmel
+  sample_rate: 16000
+  n_fft: 2048
+  hop_length: 512
+  win_length: 2048
+  n_mels: 128
+  f_min: 20
+  f_max: 8000
+  power: 2
+  top_db: 80
+  norm: mean_std
+
+backbone:
+  type: spectttra
+  pretrained_weights: pretrained/sonics-spectttra-alpha-120s.bin
+  freeze: true
+  input_shape: [128, 3744]
+  embed_dim: 384
+  num_heads: 6
+  num_layers: 12
+  t_clip: 3
+  f_clip: 1
+  mlp_ratio: 2.67
+  pe_learnable: true
+  pre_norm: true
+  attn_drop_rate: 0.1
+  pos_drop_rate: 0.1
+  proj_drop_rate: 0.0
+
+augment:
+  type: spec_augment
+  # ~ "LD" policy from the original paper, scaled down on freq to fit a
+  # 128-mel input (vs the paper's 80) and up on time for the 3744-frame
+  # window (vs the paper's ~1k Librispeech frames).
+  freq_mask_param: 27        # up to 27 / 128 = 21% of the mel axis per mask
+  n_freq_masks: 2
+  time_mask_param: 200       # up to 200 / 3744 ~= 5.3% of the time axis per mask
+  n_time_masks: 2
+  p: 1.0                     # apply on every training step
+  mask_value: 0.0            # 0 is the mean after mean_std normalisation
