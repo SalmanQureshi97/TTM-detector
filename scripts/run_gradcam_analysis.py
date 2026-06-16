@@ -169,6 +169,11 @@ def main():
         raise FileNotFoundError(f"No best.pt at {ck_path}")
     state = torch.load(ck_path, map_location=device)
     model.load_state_dict(state["model_state"])
+    # Force eval mode so dropout / SpecAugment / etc. are inactive during
+    # attribution analysis. Grad-CAM still needs gradients (handled inside
+    # GradCAM.compute via requires_grad_ on the input), but the model
+    # itself should behave deterministically.
+    model.eval()
     log.info(
         "Loaded %s | epoch %s | val_loss %.4f",
         ck_path.name, state.get("epoch"), state.get("val_loss", float("nan")),
