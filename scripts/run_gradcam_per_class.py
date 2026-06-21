@@ -96,6 +96,16 @@ def normalise(v, eps=1e-12):
 
 
 def bin_profile(prof, n_bins):
+    """Bin a normalised 1-D profile into ``n_bins`` bands by **summing**.
+
+    The raw profile sums to 1 (probability distribution over F raw bins).
+    Summing within each band preserves the property: the binned histogram
+    also sums to 1 (probability distribution over n_bins bands), and each
+    bar reads as "fraction of total attention that landed in this band".
+    That gives a consistent y-axis scale across models, axes and panels --
+    uniform attention always yields bars at 1/n_bins regardless of how
+    many raw bins fed into them.
+    """
     prof = np.asarray(prof, dtype=np.float64)
     F = len(prof)
     if n_bins >= F:
@@ -105,7 +115,7 @@ def bin_profile(prof, n_bins):
     for i in range(n_bins):
         lo = edges[i]
         hi = max(edges[i] + 1, edges[i + 1])
-        binned[i] = prof[lo:hi].mean()
+        binned[i] = prof[lo:hi].sum()
     return binned
 
 
