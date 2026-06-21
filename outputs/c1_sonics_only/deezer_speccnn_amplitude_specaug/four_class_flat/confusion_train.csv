@@ -1,0 +1,5 @@
+,real,real_enc,fake,fake_enc
+real,2000,0,0,0
+real_enc,0,1980,0,20
+fake,0,0,2000,0
+fake_enc,0,28,0,1972
