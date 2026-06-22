@@ -364,7 +364,11 @@ def main():
 
     y_max_freq = _axis_max("freq", args.n_freq_bins)
     y_max_time = _axis_max("time", args.n_time_bins)
-    log.info("Shared y-axis maxima: freq=%.4f, time=%.4f", y_max_freq, y_max_time)
+    # Single shared y-axis ceiling across every histogram (freq + time).
+    y_max_shared = max(y_max_freq, y_max_time)
+    y_max_freq = y_max_shared
+    y_max_time = y_max_shared
+    log.info("Shared y-axis max across freq + time: %.4f", y_max_shared)
 
     # --- Plot every slice with the shared y-axis --------------------------
     for slice_name, per_class in all_slices_data.items():
