@@ -200,7 +200,7 @@ def analyse_class(model, cam, manifest_path, task_cfg, source, split, class4,
 
 
 def plot_slice(per_class, slice_name, axis, n_bins, x_min, x_max, x_label,
-               model_name, out_path):
+               model_name, out_path, y_max=None):
     """One 2x2 figure for a given slice and axis (freq or time)."""
     correct_key = f"correct_{axis}"
     incorrect_key = f"incorrect_{axis}"
@@ -235,6 +235,8 @@ def plot_slice(per_class, slice_name, axis, n_bins, x_min, x_max, x_label,
         ax.set_ylabel("Mean normalised attention")
         ax.grid(alpha=0.3)
         ax.legend(loc="upper right", fontsize=9)
+        if y_max is not None:
+            ax.set_ylim(0, y_max)
     fig.suptitle(
         f"{model_name} -- {axis}-axis Grad-CAM histograms on {slice_name}",
         fontsize=13,
@@ -327,24 +329,6 @@ def main():
 
         all_slices_data[slice_name] = per_class
 
-        # --- Plot the two histograms for this slice ------------------------
-        plot_slice(
-            per_class, slice_name, axis="freq",
-            n_bins=args.n_freq_bins, x_min=freq_min_hz, x_max=freq_max_hz,
-            x_label="Frequency (Hz)",
-            model_name=model_cfg["name"],
-            out_path=out_dir / f"{slice_name}_freq_histograms.png",
-        )
-        log.info("  Saved %s", out_dir / f"{slice_name}_freq_histograms.png")
-        plot_slice(
-            per_class, slice_name, axis="time",
-            n_bins=args.n_time_bins, x_min=0, x_max=max_seconds,
-            x_label="Time (s)",
-            model_name=model_cfg["name"],
-            out_path=out_dir / f"{slice_name}_time_histograms.png",
-        )
-        log.info("  Saved %s", out_dir / f"{slice_name}_time_histograms.png")
-
         # --- CSV rows for this slice --------------------------------------
         for class4 in range(4):
             d = per_class[class4]
@@ -362,6 +346,46 @@ def main():
             for j in range(4):
                 row[f"predicted_as_{CLASS_NAMES[j]}"] = int(d["confusion_to"][j])
             csv_rows.append(row)
+
+    # --- Compute shared y-axis maxima across every slice/class/bucket -----
+    def _axis_max(axis_name, n_bins):
+        vmax = 0.0
+        for per_class in all_slices_data.values():
+            for d in per_class.values():
+                if d is None:
+                    continue
+                for k in (f"correct_{axis_name}", f"incorrect_{axis_name}"):
+                    arr = d.get(k)
+                    if arr is None:
+                        continue
+                    binned = bin_profile(arr, n_bins)
+                    vmax = max(vmax, float(binned.max()))
+        return vmax * 1.05  # 5% headroom above the tallest bar
+
+    y_max_freq = _axis_max("freq", args.n_freq_bins)
+    y_max_time = _axis_max("time", args.n_time_bins)
+    log.info("Shared y-axis maxima: freq=%.4f, time=%.4f", y_max_freq, y_max_time)
+
+    # --- Plot every slice with the shared y-axis --------------------------
+    for slice_name, per_class in all_slices_data.items():
+        plot_slice(
+            per_class, slice_name, axis="freq",
+            n_bins=args.n_freq_bins, x_min=freq_min_hz, x_max=freq_max_hz,
+            x_label="Frequency (Hz)",
+            model_name=model_cfg["name"],
+            out_path=out_dir / f"{slice_name}_freq_histograms.png",
+            y_max=y_max_freq,
+        )
+        log.info("Saved %s", out_dir / f"{slice_name}_freq_histograms.png")
+        plot_slice(
+            per_class, slice_name, axis="time",
+            n_bins=args.n_time_bins, x_min=0, x_max=max_seconds,
+            x_label="Time (s)",
+            model_name=model_cfg["name"],
+            out_path=out_dir / f"{slice_name}_time_histograms.png",
+            y_max=y_max_time,
+        )
+        log.info("Saved %s", out_dir / f"{slice_name}_time_histograms.png")
 
     # --- Final CSV + npz ----------------------------------------------------
     pd.DataFrame(csv_rows).to_csv(out_dir / "per_class_counts.csv", index=False)
