@@ -1,0 +1,10 @@
+name: four_class_flat_smooth
+type: multiclass
+target: class4_label
+num_classes: 4
+loss: cross_entropy
+# Categorical label smoothing: the right class gets prob 0.98 instead of 1.0,
+# the other three share the remaining 0.02. Prevents the model from driving
+# train loss to ~0 on memorised examples and produces better-calibrated outputs.
+# Same value as the SONICS upstream config.
+label_smoothing: 0.02

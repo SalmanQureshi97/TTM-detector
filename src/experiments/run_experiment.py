@@ -111,9 +111,16 @@ def _save_confusion(model, loader, task_cfg, device, out_dir, split_name, max_ba
 
 
 def compute_loss(task_cfg, outputs, targets):
+    eps = float(task_cfg.get("label_smoothing", 0.0))
     if task_cfg["type"] == "binary":
+        if eps > 0:
+            # Two-class label smoothing on {0, 1}: y' = y*(1-2*eps) + eps.
+            targets = targets * (1.0 - 2.0 * eps) + eps
         return torch.nn.functional.binary_cross_entropy_with_logits(outputs, targets)
     if task_cfg["type"] == "multiclass":
+        if eps > 0:
+            # F.cross_entropy supports label smoothing natively from torch 1.10.
+            return torch.nn.functional.cross_entropy(outputs, targets, label_smoothing=eps)
         return four_class_loss(outputs, targets)
     if task_cfg["type"] == "multitask":
         return multitask_loss(outputs, targets, **task_cfg["loss"])

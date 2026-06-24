@@ -1,0 +1,50 @@
+name: sonics_spectttra_alpha120s_finetune_robust
+family: transformer
+
+# Full fine-tune of SpecTTTra + light SpecAugment + 18 M trainable params.
+# This is where the anti-overfitting toolkit actually pays off: the
+# linear-probe variant has 1,540 params and doesn't really overfit, but
+# the full fine-tune has 12,000x more trainable parameters on a
+# SONICS-only training distribution, so SpecAugment + weight_decay are
+# essential here.
+
+frontend:
+  type: logmel
+  sample_rate: 16000
+  n_fft: 2048
+  hop_length: 512
+  win_length: 2048
+  n_mels: 128
+  f_min: 20
+  f_max: 8000
+  power: 2
+  top_db: 80
+  norm: mean_std
+
+backbone:
+  type: spectttra
+  pretrained_weights: pretrained/sonics-spectttra-alpha-120s.bin
+  freeze: false                # full fine-tune
+  input_shape: [128, 3744]
+  embed_dim: 384
+  num_heads: 6
+  num_layers: 12
+  t_clip: 3
+  f_clip: 1
+  mlp_ratio: 2.67
+  pe_learnable: true
+  pre_norm: true
+  attn_drop_rate: 0.1
+  pos_drop_rate: 0.1
+  proj_drop_rate: 0.0
+
+augment:
+  type: spec_augment
+  # Light "LB"-style policy scaled to the SpecTTTra log-mel grid
+  # (128 freq bins x 3744 time frames).
+  freq_mask_param: 27        # up to 27 / 128 = 21% of the freq axis
+  n_freq_masks: 1
+  time_mask_param: 200       # up to 200 / 3744 ~= 5.3% of the time axis
+  n_time_masks: 1
+  p: 0.5
+  mask_value: 0.0

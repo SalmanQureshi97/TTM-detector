@@ -1,0 +1,23 @@
+seed: 42
+sample_rate: 16000
+segment_seconds: 120
+batch_size: 2                    # full fine-tune is memory-heavy at 120 s
+num_workers: 4
+amp: true                        # required for full fine-tune
+epochs: 50
+early_stopping_patience: 5
+device: cuda
+save_dir: outputs
+grad_clip: 5.0
+
+balanced_sampling: true
+balanced_val: true
+make_reports: true
+confusion_max_per_class: null
+limit_batches: null
+
+# --- Anti-overfitting changes ---
+# Lower LR than the head-only run because the backbone is now unfrozen;
+# a high LR would tear apart SONICS' pretrained features on step 1.
+learning_rate: 0.00005
+weight_decay: 0.05               # SONICS upstream uses 0.05

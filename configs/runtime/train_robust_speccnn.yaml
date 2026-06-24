@@ -1,0 +1,19 @@
+seed: 42
+batch_size: 8
+num_workers: 0
+epochs: 50
+device: cuda
+segment_seconds: 30
+save_dir: outputs
+grad_clip: 1.0
+early_stopping_patience: 5
+balanced_sampling: true
+balanced_val: true
+make_reports: true
+confusion_max_per_class: null
+limit_batches: null
+amp: false                       # SpecCNN at 30 s fits without AMP
+
+# --- Anti-overfitting changes vs train_default.yaml ---
+learning_rate: 0.0005            # was 1e-4; matches SONICS upstream
+weight_decay: 0.05               # was 1e-4; SONICS upstream uses 0.05
