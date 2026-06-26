@@ -137,8 +137,10 @@ def analyse_class(model, cam, manifest_path, task_cfg, source, split, class4,
     ds.df = ds.df.sample(n=n_take, random_state=seed).reset_index(drop=True)
     log.info("    sampling %d / %d available rows", n_take, n_available)
 
-    correct_freq, correct_time = [], []
-    incorrect_freq, incorrect_time = [], []
+    # Per-(predicted class) buckets so we can later aggregate across true
+    # classes to answer "when the model wrongly says X, where does it look?"
+    per_pred_freq = {x: [] for x in range(4)}
+    per_pred_time = {x: [] for x in range(4)}
     confusion_to = np.zeros((4,), dtype=int)
     failures = 0
 
@@ -171,19 +173,37 @@ def analyse_class(model, cam, manifest_path, task_cfg, source, split, class4,
         freq_prof = normalise(heatmap.sum(axis=1))
         time_prof = normalise(heatmap.sum(axis=0))
 
-        if pred == class4:
-            correct_freq.append(freq_prof)
-            correct_time.append(time_prof)
-        else:
-            incorrect_freq.append(freq_prof)
-            incorrect_time.append(time_prof)
+        per_pred_freq[pred].append(freq_prof)
+        per_pred_time[pred].append(time_prof)
 
         if (i + 1) % 100 == 0:
             log.info("    processed %d/%d (correct: %d)",
-                     i + 1, n_take, len(correct_freq))
+                     i + 1, n_take, len(per_pred_freq[class4]))
 
-    n_correct = len(correct_freq)
-    n_incorrect = len(incorrect_freq)
+    # Per-(predicted class) means + counts. None when n=0.
+    per_pred = {}
+    for x in range(4):
+        n = len(per_pred_freq[x])
+        per_pred[x] = {
+            "n": n,
+            "freq": np.stack(per_pred_freq[x]).mean(axis=0) if n else None,
+            "time": np.stack(per_pred_time[x]).mean(axis=0) if n else None,
+        }
+
+    # Derived correct/incorrect (kept for backward compat with existing plots).
+    n_correct = per_pred[class4]["n"]
+    n_incorrect = sum(per_pred[x]["n"] for x in range(4) if x != class4)
+    correct_freq_mean = per_pred[class4]["freq"]
+    correct_time_mean = per_pred[class4]["time"]
+    incorrect_freq_mean = _weighted_mean(
+        [per_pred[x]["freq"] for x in range(4) if x != class4],
+        [per_pred[x]["n"] for x in range(4) if x != class4],
+    )
+    incorrect_time_mean = _weighted_mean(
+        [per_pred[x]["time"] for x in range(4) if x != class4],
+        [per_pred[x]["n"] for x in range(4) if x != class4],
+    )
+
     log.info("    correct: %d  incorrect: %d  failures: %d  acc: %.2f%%",
              n_correct, n_incorrect, failures,
              100.0 * n_correct / max(n_correct + n_incorrect, 1))
@@ -192,11 +212,94 @@ def analyse_class(model, cam, manifest_path, task_cfg, source, split, class4,
         "n_correct": n_correct,
         "n_incorrect": n_incorrect,
         "confusion_to": confusion_to.tolist(),
-        "correct_freq": np.stack(correct_freq).mean(axis=0) if correct_freq else None,
-        "correct_time": np.stack(correct_time).mean(axis=0) if correct_time else None,
-        "incorrect_freq": np.stack(incorrect_freq).mean(axis=0) if incorrect_freq else None,
-        "incorrect_time": np.stack(incorrect_time).mean(axis=0) if incorrect_time else None,
+        "correct_freq": correct_freq_mean,
+        "correct_time": correct_time_mean,
+        "incorrect_freq": incorrect_freq_mean,
+        "incorrect_time": incorrect_time_mean,
+        "per_pred": per_pred,
     }
+
+
+def _weighted_mean(profiles, counts):
+    """Weighted mean of a list of profiles by their sample counts.
+    None profiles / zero counts are skipped. Returns None if total count is 0.
+    """
+    items = [(p, c) for p, c in zip(profiles, counts) if p is not None and c > 0]
+    if not items:
+        return None
+    total = sum(c for _, c in items)
+    weighted = sum(p * c for p, c in items)
+    return weighted / total
+
+
+def aggregate_by_predicted_class(per_class, axis):
+    """For each predicted class X in 0..3, aggregate the attention
+    profiles from every (true_class != X, pred=X) bucket across true
+    classes. The result answers: "when the model wrongly says X,
+    regardless of what the audio actually is, where does it look?"
+
+    Returns dict {pred_X -> {"n": int, "profile": np.array | None}}.
+    Empty when no wrong predictions landed on that class.
+    """
+    out = {}
+    for pred_x in range(4):
+        profiles = []
+        counts = []
+        for true_c4, d in per_class.items():
+            if d is None or "per_pred" not in d:
+                continue
+            if true_c4 == pred_x:
+                continue  # only WRONG predictions
+            bucket = d["per_pred"].get(pred_x)
+            if bucket is None or bucket["n"] == 0:
+                continue
+            profiles.append(bucket[axis])
+            counts.append(bucket["n"])
+        total = sum(counts)
+        out[pred_x] = {
+            "n": total,
+            "profile": _weighted_mean(profiles, counts) if profiles else None,
+        }
+    return out
+
+
+def plot_slice_by_pred(per_class, slice_name, axis, n_bins, x_min, x_max,
+                       x_label, model_name, out_path, y_max=None):
+    """4-panel figure (one per predicted class) of wrong-prediction
+    attention aggregated across true classes."""
+    agg = aggregate_by_predicted_class(per_class, axis)
+    bar_width = (x_max - x_min) / max(n_bins, 1)
+    x = np.linspace(x_min, x_max, n_bins)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for pred_x, ax in zip(range(4), axes.flat):
+        bucket = agg.get(pred_x)
+        if bucket is None or bucket["profile"] is None or bucket["n"] == 0:
+            ax.text(0.5, 0.5,
+                    f"no wrong predictions\nlanded on class {pred_x} ({CLASS_NAMES[pred_x]})",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=11, color="#888888")
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(f"predicted as {CLASS_NAMES[pred_x]} (wrong)")
+            continue
+        ax.bar(x, bin_profile(bucket["profile"], n_bins),
+               width=bar_width, color=COLOR_INCORRECT, alpha=0.7,
+               label=f"wrong predictions (n={bucket['n']})")
+        ax.set_title(f"predicted as {CLASS_NAMES[pred_x]} (wrong)")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Mean normalised attention")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
+        if y_max is not None:
+            ax.set_ylim(0, y_max)
+    fig.suptitle(
+        f"{model_name} -- {axis}-axis attention when the model wrongly predicts a class "
+        f"({slice_name})",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_slice(per_class, slice_name, axis, n_bins, x_min, x_max, x_label,
@@ -305,11 +408,23 @@ def main():
 
         cache_path = out_dir / f"{slice_name}_cache.pkl"
         if cache_path.exists() and not args.force:
-            log.info("  cache found at %s -- loading and skipping Grad-CAM",
-                     cache_path)
             with open(cache_path, "rb") as f:
                 per_class = pickle.load(f)
+            # Auto-invalidate caches that pre-date the per_pred bucketing.
+            has_per_pred = any(
+                d is not None and "per_pred" in d for d in per_class.values()
+            )
+            if not has_per_pred:
+                log.info("  cache at %s is in the old format (no per_pred); "
+                         "recomputing", cache_path)
+                per_class = None
+            else:
+                log.info("  cache found at %s -- loading and skipping Grad-CAM",
+                         cache_path)
         else:
+            per_class = None
+
+        if per_class is None:
             per_class = {}
             for class4 in range(4):
                 if class4 not in allowed_classes:
@@ -350,6 +465,7 @@ def main():
     # --- Compute shared y-axis maxima across every slice/class/bucket -----
     def _axis_max(axis_name, n_bins):
         vmax = 0.0
+        # Per-true-class correct/incorrect bars.
         for per_class in all_slices_data.values():
             for d in per_class.values():
                 if d is None:
@@ -360,6 +476,13 @@ def main():
                         continue
                     binned = bin_profile(arr, n_bins)
                     vmax = max(vmax, float(binned.max()))
+            # Per-predicted-class wrong-prediction aggregates.
+            agg = aggregate_by_predicted_class(per_class, axis_name)
+            for bucket in agg.values():
+                if bucket["profile"] is None:
+                    continue
+                binned = bin_profile(bucket["profile"], n_bins)
+                vmax = max(vmax, float(binned.max()))
         return vmax * 1.05  # 5% headroom above the tallest bar
 
     y_max_freq = _axis_max("freq", args.n_freq_bins)
@@ -390,6 +513,27 @@ def main():
             y_max=y_max_time,
         )
         log.info("Saved %s", out_dir / f"{slice_name}_time_histograms.png")
+        # --- per-predicted-class wrong-prediction histograms ----------
+        plot_slice_by_pred(
+            per_class, slice_name, axis="freq",
+            n_bins=args.n_freq_bins, x_min=freq_min_hz, x_max=freq_max_hz,
+            x_label="Frequency (Hz)",
+            model_name=model_cfg["name"],
+            out_path=out_dir / f"{slice_name}_freq_histograms_by_pred.png",
+            y_max=y_max_freq,
+        )
+        log.info("Saved %s",
+                 out_dir / f"{slice_name}_freq_histograms_by_pred.png")
+        plot_slice_by_pred(
+            per_class, slice_name, axis="time",
+            n_bins=args.n_time_bins, x_min=0, x_max=max_seconds,
+            x_label="Time (s)",
+            model_name=model_cfg["name"],
+            out_path=out_dir / f"{slice_name}_time_histograms_by_pred.png",
+            y_max=y_max_time,
+        )
+        log.info("Saved %s",
+                 out_dir / f"{slice_name}_time_histograms_by_pred.png")
 
     # --- Final CSV + npz ----------------------------------------------------
     pd.DataFrame(csv_rows).to_csv(out_dir / "per_class_counts.csv", index=False)
