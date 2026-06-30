@@ -5,7 +5,7 @@ batch_size: 2                    # full fine-tune is memory-heavy at 120 s
 num_workers: 4
 amp: true                        # required for full fine-tune
 epochs: 50
-early_stopping_patience: 5
+early_stopping_patience: 10
 device: cuda
 save_dir: outputs
 grad_clip: 5.0
