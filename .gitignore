@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .DS_Store
 /reports
+
+*.pt
+*.log
