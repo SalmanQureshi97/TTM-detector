@@ -1,0 +1,10 @@
+slice,JSD_vs_sonics_train
+sonics_train_mixed,0.000000
+sonics_val_real,0.004323
+sonics_val_real_enc,0.004824
+sonics_val_fake_enc,0.005353
+sonics_val_fake,0.007436
+fma_real_encoded,0.009926
+fmc_fake_natural,0.014457
+fma_real,0.016733
+fmc_fake_encoded,0.025090
