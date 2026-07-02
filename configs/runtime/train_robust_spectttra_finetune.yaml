@@ -14,10 +14,24 @@ balanced_sampling: true
 balanced_val: true
 make_reports: true
 confusion_max_per_class: null
-limit_batches: null
 
 # --- Anti-overfitting changes ---
 # Lower LR than the head-only run because the backbone is now unfrozen;
 # a high LR would tear apart SONICS' pretrained features on step 1.
 learning_rate: 0.00005
-weight_decay: 0.05               # SONICS upstream uses 0.05
+weight_decay: 0.05
+
+# --- Convergence-stability additions (2025-07-01) ---
+# Gradient accumulation: forward+backward 64 mini-batches of size 2 before
+# stepping the optimizer, giving an effective batch of 128 (matching what
+# SONICS' upstream pretraining used). Without this, Adam's optimizer state
+# is updated from batch-2 statistics which are essentially noise for an
+# 18M-param backbone.
+grad_accum_steps: 64
+
+# Linear LR warmup for the first 5 epochs, ramping from warmup_lr to
+# learning_rate, then cosine-decay for the remaining 45 epochs. The
+# freshly-initialised four-class head would otherwise flow huge random
+# gradients into the pretrained backbone on step 1 at full LR.
+warmup_epochs: 5
+warmup_lr: 0.000001

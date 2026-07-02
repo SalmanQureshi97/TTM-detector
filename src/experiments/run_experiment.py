@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -178,9 +178,44 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     )
 
     epochs = runtime_cfg["epochs"]
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    # LR schedule with optional warmup. If warmup_epochs > 0, ramp the LR
+    # linearly from warmup_lr up to learning_rate over that many epochs,
+    # then cosine-decay for the remaining epochs. This is what SONICS'
+    # upstream training used and prevents the fresh classifier head from
+    # destroying the pretrained backbone in the first few optimizer steps.
+    warmup_epochs = int(runtime_cfg.get("warmup_epochs", 0) or 0)
+    if warmup_epochs > 0:
+        target_lr = float(runtime_cfg["learning_rate"])
+        warmup_lr = float(runtime_cfg.get("warmup_lr", 1e-6))
+        start_factor = max(warmup_lr / target_lr, 1e-8) if target_lr > 0 else 1.0
+        warmup_sched = LinearLR(
+            optimizer, start_factor=start_factor, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_epochs = max(epochs - warmup_epochs, 1)
+        main_sched = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+        scheduler = SequentialLR(
+            optimizer, schedulers=[warmup_sched, main_sched],
+            milestones=[warmup_epochs],
+        )
+        log.info("LR schedule: linear warmup %d epochs from %.2e -> %.2e, "
+                 "then cosine decay over %d epochs",
+                 warmup_epochs, warmup_lr, target_lr, cosine_epochs)
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     grad_clip = runtime_cfg.get("grad_clip", 1.0)
     patience = runtime_cfg.get("early_stopping_patience", 5)
+
+    # Gradient accumulation: run this many forward/backward passes before an
+    # optimizer step. Effective batch = batch_size * grad_accum_steps. Useful
+    # when the physical batch is memory-limited (SpecTTTra 120s full fine-tune
+    # is stuck at batch=2, so grad_accum_steps=64 gets us SONICS' effective
+    # batch of 128 without extra memory).
+    grad_accum_steps = int(runtime_cfg.get("grad_accum_steps", 1) or 1)
+    if grad_accum_steps > 1:
+        log.info("Gradient accumulation: %d steps -> effective batch = %d",
+                 grad_accum_steps,
+                 grad_accum_steps * runtime_cfg["batch_size"])
 
     # Mixed precision: fp16 forward/backward roughly halves activation memory
     # and speeds up matmul/conv on Ampere. No-op when amp=false or on CPU.
@@ -223,24 +258,36 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         model.train()
         train_loss = 0.0
         train_steps = 0
+        optimizer.zero_grad()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [train]", leave=False)
         for batch in pbar:
             audio = batch["audio"].to(device, non_blocking=True)
             target = move_target_to_device(batch["target"], device)
-            optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(audio)
                 loss = compute_loss(task_cfg, outputs, target)
-            scaler.scale(loss).backward()
+            # Divide loss so summed gradients over grad_accum_steps mini-batches
+            # equal the gradient of a single larger batch.
+            scaler.scale(loss / grad_accum_steps).backward()
+            train_loss += loss.item()
+            train_steps += 1
+            if train_steps % grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if limit_batches and train_steps >= limit_batches:
+                break
+
+        # Flush any remaining accumulated gradient at the end of the epoch.
+        if train_steps % grad_accum_steps != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            train_loss += loss.item()
-            train_steps += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-            if limit_batches and train_steps >= limit_batches:
-                break
+            optimizer.zero_grad()
 
         avg_train_loss = train_loss / max(train_steps, 1)
 
