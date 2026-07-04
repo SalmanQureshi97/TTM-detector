@@ -1,0 +1,47 @@
+name: deezer_speccnn_amplitude_standardised
+family: cnn
+
+# Same architecture as deezer_speccnn_amplitude_robust.yaml. What's new:
+#   1. Dataset-wide standardisation via `stats_file:`. The Deezer frontend
+#      loads (audio_mean, audio_std, spec_mean, spec_std) computed offline
+#      over the SONICS training set by scripts/compute_dataset_stats.py.
+#      The same (mean, std) is applied to every input at both training and
+#      inference, so cross-domain FMA / FMC audio arrives at the model on
+#      the same statistical footing as SONICS -- the direct test of the
+#      "content-distribution shift causes cross-domain failure" hypothesis
+#      from reports/spectral_analysis_1pager.
+#   2. SpecAugment uses the exact SONICS-upstream magnitudes (freq_mask=8,
+#      time_mask=8, n_freq=1, n_time=2, p=0.5) -- much lighter than our
+#      earlier LB defaults. Combined with weight_decay=0.05 (in
+#      train_robust_speccnn.yaml) and label_smoothing=0.02 (in
+#      four_class_flat_smooth.yaml).
+
+frontend:
+  type: deezer_amplitude
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  hf_cut: 16000
+  # Legacy constants -- ignored when stats_file is set, kept for backwards
+  # compatibility with the loader:
+  normalize_mean: -4.0
+  normalize_std: 3.0
+  # New: point at the JSON produced by scripts/compute_dataset_stats.py.
+  stats_file: outputs/dataset_stats/sonics_c1.json
+
+backbone:
+  type: speccnn
+  channels: [128, 128, 256, 256, 512, 512]
+  strides: [1, 3, 3, 3, 3, 3]
+  kernel_sizes: [3, 3, 3, 3, 3, 3]
+  head_dim: 64
+
+augment:
+  type: spec_augment
+  # Exact SONICS upstream magnitudes (spectttra_f3t5-120s.yaml).
+  freq_mask_param: 8
+  n_freq_masks: 1
+  time_mask_param: 8
+  n_time_masks: 2
+  p: 0.5
+  mask_value: 0.0

@@ -38,6 +38,7 @@ class UnifiedAudioModel(nn.Module):
                 hf_cut=frontend_cfg["hf_cut"],
                 normalize_mean=frontend_cfg["normalize_mean"],
                 normalize_std=frontend_cfg["normalize_std"],
+                stats_file=frontend_cfg.get("stats_file"),
             )
         else:
             raise ValueError(f"Unsupported frontend={frontend_cfg['type']}")
