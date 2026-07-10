@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-import multiprocessing as mp
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -41,20 +41,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def _worker_init():
-    """Cap threads so N info() workers don't fight over BLAS."""
-    torch.set_num_threads(1)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
+def _duration(pair):
+    """Return (index, duration_sec_or_none) for one row.
 
-
-def _duration(filepath):
-    """Return duration_sec, or None on any read failure."""
+    We tag the input with an index so the caller can use `imap_unordered`
+    (which streams results as they finish, not in submission order). That
+    lets the tqdm bar tick smoothly instead of stalling on whichever file
+    happens to be slowest in the head of the queue.
+    """
+    idx, filepath = pair
     try:
         info = torchaudio.info(filepath)
-        return info.num_frames / info.sample_rate
+        return idx, info.num_frames / info.sample_rate
     except Exception:
-        return None
+        return idx, None
 
 
 def parse_args():
@@ -65,12 +65,16 @@ def parse_args():
                    help="Path to write chunked manifest CSV")
     p.add_argument("--chunk-seconds", type=float, default=30.0,
                    help="Chunk length in seconds (default 30).")
+    # info() is I/O-bound so more workers than ~16 usually just add spawn +
+    # scheduling overhead. Default caps at 16 regardless of cpu_count.
     p.add_argument("--num-workers", type=int,
-                   default=max(1, (os.cpu_count() or 4) - 1))
-    p.add_argument("--chunksize", type=int, default=32,
-                   help="pool.imap_unordered chunksize. info() is fast, "
-                        "so keep this high to amortise dispatch.")
+                   default=min(16, max(1, (os.cpu_count() or 4) - 1)))
+    p.add_argument("--chunksize", type=int, default=8,
+                   help="pool.imap_unordered chunksize. Small values give "
+                        "snappier progress; larger values amortise IPC.")
     p.add_argument("--filepath-col", default="filepath")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Process only the first N rows (smoke test).")
     return p.parse_args()
 
 
@@ -86,19 +90,29 @@ def main():
     log.info("Loading manifest %s", args.manifest)
     df = pd.read_csv(args.manifest, low_memory=False)
     log.info("Input rows: %d", len(df))
+    if args.limit:
+        df = df.head(args.limit).reset_index(drop=True)
+        log.info("--limit set: processing first %d rows only.", len(df))
 
     filepaths = df[args.filepath_col].tolist()
+    tasks = list(enumerate(filepaths))
 
-    torch.set_num_threads(1)
-    log.info("Reading durations with %d workers (chunksize=%d) ...",
-             args.num_workers, args.chunksize)
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=args.num_workers,
-                  initializer=_worker_init) as pool:
-        durations = list(tqdm(
-            pool.imap(_duration, filepaths, chunksize=args.chunksize),
-            total=len(filepaths), desc="info()", mininterval=1.0,
-        ))
+    # Threads, not processes. torchaudio.info() is a C call that releases
+    # the GIL for the I/O and header parse. Threads share this process's
+    # already-imported torch, so there is no spawn cost, no CUDA-context
+    # deadlock, and Ctrl-C actually works.
+    torch.set_num_threads(1)  # keep the parent process quiet
+    log.info("Reading durations with %d threads ...", args.num_workers)
+    durations = [None] * len(filepaths)
+    try:
+        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+            it = pool.map(_duration, tasks)
+            for idx, dur in tqdm(it, total=len(tasks), desc="info()",
+                                 mininterval=0.5, smoothing=0.05):
+                durations[idx] = dur
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user; partial progress discarded.")
+        raise
 
     df["track_duration_sec"] = durations
     n_bad = df["track_duration_sec"].isna().sum()

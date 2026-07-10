@@ -32,9 +32,10 @@ import argparse
 import json
 import logging
 import math
-import multiprocessing as mp
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -48,25 +49,37 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-_WORKER_STATE = {}
+# Thread-shared config + per-thread STFT modules. Using threads (not
+# processes) because torchaudio.load + torch.stft both release the GIL for
+# their C++ implementations. Threads avoid the spawn / cold-torch-import
+# / CUDA-context-deadlock failure modes that killed the previous
+# ProcessPoolExecutor version on JupyterHub.
+_SHARED = {}
+_TLS = threading.local()
 
 
-def _worker_init(sample_rate, max_seconds, n_fft, hop_length, hf_cut):
-    """Each worker: cap threads, pre-build the STFT modules once."""
-    # Prevent every worker from spawning `nproc` BLAS threads. Without this,
-    # N workers x M cores = N*M threads all fighting each other, which is why
-    # the server slows to a crawl.
-    torch.set_num_threads(1)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
+def _pool_init(sample_rate, max_seconds, n_fft, hop_length, hf_cut):
+    _SHARED["sample_rate"] = int(sample_rate)
+    _SHARED["max_len"] = int(sample_rate * max_seconds)
+    _SHARED["hf_cut"] = int(hf_cut)
+    _SHARED["n_fft"] = int(n_fft)
+    _SHARED["hop_length"] = int(hop_length)
 
-    _WORKER_STATE["sample_rate"] = int(sample_rate)
-    _WORKER_STATE["max_len"] = int(sample_rate * max_seconds)
-    _WORKER_STATE["hf_cut"] = int(hf_cut)
-    _WORKER_STATE["spec"] = torchaudio.transforms.Spectrogram(
-        n_fft=n_fft, hop_length=hop_length, power=2.0
-    )
-    _WORKER_STATE["db"] = torchaudio.transforms.AmplitudeToDB()
+
+def _thread_modules():
+    """Return (spec, db) modules created lazily per-thread."""
+    m = getattr(_TLS, "modules", None)
+    if m is None:
+        m = (
+            torchaudio.transforms.Spectrogram(
+                n_fft=_SHARED["n_fft"],
+                hop_length=_SHARED["hop_length"],
+                power=2.0,
+            ),
+            torchaudio.transforms.AmplitudeToDB(),
+        )
+        _TLS.modules = m
+    return m
 
 
 def _accumulate_one_chunk(audio_chunk, spec_op, to_db, hf_cut, sample_rate):
@@ -99,11 +112,10 @@ def _worker(task):
     """
     filepath, chunk_starts = task
     try:
-        sample_rate = _WORKER_STATE["sample_rate"]
-        max_len = _WORKER_STATE["max_len"]
-        hf_cut = _WORKER_STATE["hf_cut"]
-        spec_op = _WORKER_STATE["spec"]
-        to_db = _WORKER_STATE["db"]
+        sample_rate = _SHARED["sample_rate"]
+        max_len = _SHARED["max_len"]
+        hf_cut = _SHARED["hf_cut"]
+        spec_op, to_db = _thread_modules()
 
         info = torchaudio.info(filepath)
         src_sr = info.sample_rate
@@ -164,13 +176,12 @@ def parse_args():
                    help="Upper frequency (Hz) to keep in the spectrogram, "
                         "mirroring DeezerAmplitudeFrontend.hf_cut.")
     p.add_argument("--num-workers", type=int,
-                   default=max(1, (os.cpu_count() or 4) - 1),
-                   help="Default: cpu_count() - 1. Each worker uses a "
-                        "single BLAS thread (see _worker_init).")
+                   default=min(16, max(1, (os.cpu_count() or 4) - 1)),
+                   help="Number of I/O + STFT threads (not processes). "
+                        "Default caps at 16.")
     p.add_argument("--chunksize", type=int, default=8,
-                   help="pool.imap_unordered chunksize. 8-32 is a sweet "
-                        "spot for I/O-heavy jobs; go higher if the pool "
-                        "dispatcher is CPU-bound.")
+                   help="Unused (kept for CLI compatibility with the "
+                        "old ProcessPool version).")
     p.add_argument("--output", required=True)
     return p.parse_args()
 
@@ -224,35 +235,36 @@ def main():
     n_ok_files = 0
     n_failed_files = 0
 
-    # Cap the parent process's own threading too -- otherwise torch ops in
-    # the main process can spawn worker BLAS threads that compete with the
-    # pool.
+    # Cap the parent's BLAS thread pool -- with N thread workers each doing
+    # STFT, we don't want each STFT internally spawning M BLAS threads.
     torch.set_num_threads(1)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-    log.info("Spawning %d workers over %d files / %d chunks (chunksize=%d) ...",
-             args.num_workers, n_files, n_chunks_total, args.chunksize)
-    init_args = (args.sample_rate, args.max_seconds,
-                 args.n_fft, args.hop_length, args.hf_cut)
-    ctx = mp.get_context("spawn")  # safest for torch + macOS
-    with ctx.Pool(processes=args.num_workers,
-                  initializer=_worker_init,
-                  initargs=init_args) as pool:
-        # imap_unordered streams results back as they finish. chunksize > 1
-        # amortises IPC / dispatch overhead across many small tasks.
-        it = pool.imap_unordered(_worker, tasks, chunksize=args.chunksize)
-        for res in tqdm(it, total=n_files, desc="accumulate",
-                        mininterval=1.0):
-            if res is None:
-                n_failed_files += 1
-                continue
-            a_s, a_sq, a_n, s_s, s_sq, s_n = res
-            audio_sum += a_s
-            audio_sum_sq += a_sq
-            audio_n += a_n
-            spec_sum += s_s
-            spec_sum_sq += s_sq
-            spec_n += s_n
-            n_ok_files += 1
+    _pool_init(args.sample_rate, args.max_seconds,
+               args.n_fft, args.hop_length, args.hf_cut)
+
+    log.info("Processing %d files / %d chunks with %d threads ...",
+             n_files, n_chunks_total, args.num_workers)
+    try:
+        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+            it = pool.map(_worker, tasks)
+            for res in tqdm(it, total=n_files, desc="accumulate",
+                            mininterval=0.5, smoothing=0.05):
+                if res is None:
+                    n_failed_files += 1
+                    continue
+                a_s, a_sq, a_n, s_s, s_sq, s_n = res
+                audio_sum += a_s
+                audio_sum_sq += a_sq
+                audio_n += a_n
+                spec_sum += s_s
+                spec_sum_sq += s_sq
+                spec_n += s_n
+                n_ok_files += 1
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user; partial progress discarded.")
+        raise
 
     if audio_n == 0 or spec_n == 0:
         log.error("No samples accumulated (n_ok_files=%d, n_failed_files=%d). "
