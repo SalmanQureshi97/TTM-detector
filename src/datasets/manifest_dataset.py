@@ -42,7 +42,30 @@ class AudioManifestDataset(Dataset):
         return len(self.df)
 
     def _process_row(self, row):
-        audio, sr = torchaudio.load(Path(row["filepath"]))
+        filepath = Path(row["filepath"])
+
+        # Chunked-manifest mode: if the row carries a chunk_start_sec, decode
+        # only the frames for that 30 s window (torchaudio.load supports
+        # frame_offset + num_frames, so this is cheap even for long files).
+        # Falls back to the legacy first-max_seconds behavior otherwise, so
+        # older manifests still work unchanged.
+        chunk_start = row.get("chunk_start_sec") if hasattr(row, "get") else None
+        if chunk_start is not None and pd.notna(chunk_start):
+            info = torchaudio.info(filepath)
+            src_sr = info.sample_rate
+            frame_offset = int(float(chunk_start) * src_sr)
+            # +100 ms slack in case resampling trims edges.
+            needed_src_frames = (
+                int(self.max_seconds * src_sr) + int(0.1 * src_sr)
+            )
+            audio, sr = torchaudio.load(
+                filepath,
+                frame_offset=frame_offset,
+                num_frames=needed_src_frames,
+            )
+        else:
+            audio, sr = torchaudio.load(filepath)
+
         if sr != self.sample_rate:
             audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
         audio = audio.mean(dim=0)

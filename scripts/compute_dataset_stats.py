@@ -4,17 +4,26 @@ The output JSON is consumed by ``DeezerAmplitudeFrontend`` when its config sets
 ``stats_file:``. Same (mean, std) is applied to every input at both training
 and inference so the model never sees an unfamiliar scale/offset.
 
-Preprocessing mirrors ``AudioManifestDataset._process_row`` + the
-``DeezerAmplitudeFrontend`` spectrogram op exactly, so stats are computed on
-the same distribution the model will see at forward-pass time.
+Two input-manifest modes:
+  * **Chunked manifest** (recommended, matches the new training pipeline):
+    the manifest has a ``chunk_start_sec`` column emitted by
+    ``scripts/build_chunked_manifest.py``. This script groups all rows by
+    ``filepath`` so each file is decoded exactly once, then iterates every
+    listed chunk within that file, accumulating stats across chunks. Matches
+    what the training loader sees.
+  * **Legacy** (no ``chunk_start_sec`` column): treat each row as a single
+    "first ``max_seconds`` seconds" chunk. Equivalent to the pre-chunking
+    training pipeline.
+
+Preprocessing (per chunk) mirrors ``AudioManifestDataset._process_row`` and
+the ``DeezerAmplitudeFrontend`` spectrogram op exactly.
 
 Usage:
     python scripts/compute_dataset_stats.py \\
-        --manifest /home/jovyan/Thesis/Code/data/manifests/master_manifest_with_splits.csv \\
+        --manifest /home/jovyan/Thesis/Code/data/manifests/master_manifest_with_splits_chunked.csv \\
         --source SONICS --split train \\
         --sample-rate 44100 --n-fft 2048 --hop-length 512 --hf-cut 16000 \\
-        --num-workers 4 \\
-        --output outputs/dataset_stats/sonics_c1.json
+        --output outputs/dataset_stats/sonics_c1_chunked.json
 """
 
 from __future__ import annotations
@@ -60,13 +69,35 @@ def _worker_init(sample_rate, max_seconds, n_fft, hop_length, hf_cut):
     _WORKER_STATE["db"] = torchaudio.transforms.AmplitudeToDB()
 
 
-def _worker(filepath):
-    """Load one file, return per-file audio + spec running sums.
+def _accumulate_one_chunk(audio_chunk, spec_op, to_db, hf_cut, sample_rate):
+    """Accumulate (audio + spec) running sums for a single 30 s chunk."""
+    aud64 = audio_chunk.to(torch.float64)
+    a_s = float(aud64.sum().item())
+    a_sq = float((aud64 * aud64).sum().item())
+    a_n = int(aud64.numel())
 
-    Returns a 6-tuple: (audio_sum, audio_sum_sq, audio_n,
-                        spec_sum,  spec_sum_sq,  spec_n).
-    On any load / decode error returns None so the caller can skip.
+    spec = to_db(spec_op(audio_chunk))
+    hz_per_bin = sample_rate / 2.0 / spec.shape[-2]
+    max_bin = int(hf_cut / hz_per_bin)
+    spec = spec[:max_bin, :]
+
+    spec64 = spec.to(torch.float64)
+    s_s = float(spec64.sum().item())
+    s_sq = float((spec64 * spec64).sum().item())
+    s_n = int(spec64.numel())
+    return a_s, a_sq, a_n, s_s, s_sq, s_n
+
+
+def _worker(task):
+    """Process one *file* (possibly with many chunk offsets).
+
+    task = (filepath, [chunk_start_sec, chunk_start_sec, ...]).
+    An empty chunk_starts list means "first max_seconds only" (legacy).
+
+    Returns the 6-tuple aggregated over all listed chunks of that file,
+    or None on failure.
     """
+    filepath, chunk_starts = task
     try:
         sample_rate = _WORKER_STATE["sample_rate"]
         max_len = _WORKER_STATE["max_len"]
@@ -74,43 +105,44 @@ def _worker(filepath):
         spec_op = _WORKER_STATE["spec"]
         to_db = _WORKER_STATE["db"]
 
-        # Peek at the file's own sample rate so we can decode only the frames
-        # we need. Decoding the whole track when we only keep 30 s is the #1
-        # bottleneck for long SONICS clips.
         info = torchaudio.info(filepath)
         src_sr = info.sample_rate
-        # +100 ms slack in case of resampling edge trimming.
-        needed_src_frames = int(max_len * src_sr / sample_rate) + int(0.1 * src_sr)
-        audio, sr = torchaudio.load(filepath, num_frames=needed_src_frames)
+        chunk_src_frames = int(max_len * src_sr / sample_rate)
+        slack = int(0.1 * src_sr)
 
-        if sr != sample_rate:
-            audio = torchaudio.functional.resample(audio, sr, sample_rate)
-        audio = audio.mean(dim=0)  # mono
+        # Legacy mode: single chunk starting at 0.
+        if not chunk_starts:
+            chunk_starts = [0.0]
 
-        if audio.numel() > max_len:
-            audio = audio[:max_len]
-        elif audio.numel() < max_len:
-            audio = torch.nn.functional.pad(audio, (0, max_len - audio.numel()))
+        # Running sums for this file, summed over all its chunks.
+        tot_a_s = tot_a_sq = 0.0; tot_a_n = 0
+        tot_s_s = tot_s_sq = 0.0; tot_s_n = 0
 
-        # Audio-domain stats (float64 sums for numerical stability).
-        aud64 = audio.to(torch.float64)
-        audio_sum = float(aud64.sum().item())
-        audio_sum_sq = float((aud64 * aud64).sum().item())
-        audio_n = int(aud64.numel())
+        for start_sec in chunk_starts:
+            frame_offset = int(float(start_sec) * src_sr)
+            audio, sr = torchaudio.load(
+                filepath,
+                frame_offset=frame_offset,
+                num_frames=chunk_src_frames + slack,
+            )
+            if sr != sample_rate:
+                audio = torchaudio.functional.resample(audio, sr, sample_rate)
+            audio = audio.mean(dim=0)  # mono
+            if audio.numel() > max_len:
+                audio = audio[:max_len]
+            elif audio.numel() < max_len:
+                audio = torch.nn.functional.pad(
+                    audio, (0, max_len - audio.numel())
+                )
 
-        # Spectrogram-domain stats: replicate DeezerAmplitudeFrontend exactly.
-        spec = to_db(spec_op(audio))
-        hz_per_bin = sample_rate / 2.0 / spec.shape[-2]
-        max_bin = int(hf_cut / hz_per_bin)
-        spec = spec[:max_bin, :]
+            a_s, a_sq, a_n, s_s, s_sq, s_n = _accumulate_one_chunk(
+                audio, spec_op, to_db, hf_cut, sample_rate
+            )
+            tot_a_s += a_s; tot_a_sq += a_sq; tot_a_n += a_n
+            tot_s_s += s_s; tot_s_sq += s_sq; tot_s_n += s_n
 
-        spec64 = spec.to(torch.float64)
-        spec_sum = float(spec64.sum().item())
-        spec_sum_sq = float((spec64 * spec64).sum().item())
-        spec_n = int(spec64.numel())
-
-        return (audio_sum, audio_sum_sq, audio_n,
-                spec_sum, spec_sum_sq, spec_n)
+        return (tot_a_s, tot_a_sq, tot_a_n,
+                tot_s_s, tot_s_sq, tot_s_n)
     except Exception:
         return None
 
@@ -164,7 +196,23 @@ def main():
         log.error("No rows to process -- aborting.")
         return
 
-    filepaths = df["filepath"].tolist()
+    # Group rows by filepath so each file is decoded exactly once, even when
+    # the chunked manifest has multiple rows per file (one per chunk).
+    if "chunk_start_sec" in df.columns:
+        log.info("Chunked manifest detected (%d chunk rows over %d files, "
+                 "avg %.2f chunks/file).",
+                 len(df), df["filepath"].nunique(),
+                 len(df) / max(df["filepath"].nunique(), 1))
+        grouped = (df.groupby("filepath", sort=False)["chunk_start_sec"]
+                     .apply(lambda s: sorted(float(x) for x in s.tolist())))
+        tasks = [(fp, starts) for fp, starts in grouped.items()]
+    else:
+        log.info("Legacy manifest (no chunk_start_sec). Using first "
+                 "%.1f s of every file.", args.max_seconds)
+        tasks = [(fp, []) for fp in df["filepath"].tolist()]
+
+    n_files = len(tasks)
+    n_chunks_total = sum(max(1, len(s)) for _, s in tasks)
 
     # Running sums (float64) aggregated across workers.
     audio_sum = 0.0
@@ -173,16 +221,16 @@ def main():
     spec_sum = 0.0
     spec_sum_sq = 0.0
     spec_n = 0
-    n_ok = 0
-    n_failed = 0
+    n_ok_files = 0
+    n_failed_files = 0
 
-    # Cap the parent process's own threading too -- torch.load in the main
-    # process (via manifest read etc.) can otherwise still spawn worker
-    # BLAS threads that compete with the pool.
+    # Cap the parent process's own threading too -- otherwise torch ops in
+    # the main process can spawn worker BLAS threads that compete with the
+    # pool.
     torch.set_num_threads(1)
 
-    log.info("Spawning %d workers over %d files (chunksize=%d) ...",
-             args.num_workers, len(filepaths), args.chunksize)
+    log.info("Spawning %d workers over %d files / %d chunks (chunksize=%d) ...",
+             args.num_workers, n_files, n_chunks_total, args.chunksize)
     init_args = (args.sample_rate, args.max_seconds,
                  args.n_fft, args.hop_length, args.hf_cut)
     ctx = mp.get_context("spawn")  # safest for torch + macOS
@@ -190,13 +238,12 @@ def main():
                   initializer=_worker_init,
                   initargs=init_args) as pool:
         # imap_unordered streams results back as they finish. chunksize > 1
-        # amortises IPC / dispatch overhead across many small tasks -- with
-        # ~180k files this is dramatically faster than submit()-per-file.
-        it = pool.imap_unordered(_worker, filepaths, chunksize=args.chunksize)
-        for res in tqdm(it, total=len(filepaths), desc="accumulate",
+        # amortises IPC / dispatch overhead across many small tasks.
+        it = pool.imap_unordered(_worker, tasks, chunksize=args.chunksize)
+        for res in tqdm(it, total=n_files, desc="accumulate",
                         mininterval=1.0):
             if res is None:
-                n_failed += 1
+                n_failed_files += 1
                 continue
             a_s, a_sq, a_n, s_s, s_sq, s_n = res
             audio_sum += a_s
@@ -205,11 +252,11 @@ def main():
             spec_sum += s_s
             spec_sum_sq += s_sq
             spec_n += s_n
-            n_ok += 1
+            n_ok_files += 1
 
     if audio_n == 0 or spec_n == 0:
-        log.error("No samples accumulated (n_ok=%d, n_failed=%d). Aborting.",
-                  n_ok, n_failed)
+        log.error("No samples accumulated (n_ok_files=%d, n_failed_files=%d). "
+                  "Aborting.", n_ok_files, n_failed_files)
         return
 
     audio_mean = audio_sum / audio_n
@@ -236,8 +283,10 @@ def main():
             "manifest": args.manifest,
             "source": args.source,
             "split": args.split,
-            "n_files_processed": n_ok,
-            "n_files_failed": n_failed,
+            "n_files_processed": n_ok_files,
+            "n_files_failed": n_failed_files,
+            "n_chunks_total": n_chunks_total,
+            "chunked_manifest": "chunk_start_sec" in df.columns,
         },
     }
     with open(out_path, "w") as f:
@@ -245,7 +294,8 @@ def main():
     log.info("Saved %s", out_path)
     log.info("  audio: mean=%.6f std=%.6f  (n=%d)", audio_mean, audio_std, audio_n)
     log.info("  spec:  mean=%.6f std=%.6f  (n=%d)", spec_mean,  spec_std,  spec_n)
-    log.info("  files: %d ok, %d failed", n_ok, n_failed)
+    log.info("  files: %d ok, %d failed  |  chunks aggregated: %d",
+             n_ok_files, n_failed_files, n_chunks_total)
 
 
 if __name__ == "__main__":
