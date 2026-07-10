@@ -32,10 +32,7 @@ import argparse
 import json
 import logging
 import math
-import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -49,84 +46,28 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-# Thread-shared config + per-thread STFT modules. Using threads (not
-# processes) because torchaudio.load + torch.stft both release the GIL for
-# their C++ implementations. Threads avoid the spawn / cold-torch-import
-# / CUDA-context-deadlock failure modes that killed the previous
-# ProcessPoolExecutor version on JupyterHub.
-_SHARED = {}
-_TLS = threading.local()
+def _process_file(filepath, chunk_starts, cfg, spec_op, to_db):
+    """Process one file and return per-file running sums over all chunks.
 
-
-def _pool_init(sample_rate, max_seconds, n_fft, hop_length, hf_cut):
-    _SHARED["sample_rate"] = int(sample_rate)
-    _SHARED["max_len"] = int(sample_rate * max_seconds)
-    _SHARED["hf_cut"] = int(hf_cut)
-    _SHARED["n_fft"] = int(n_fft)
-    _SHARED["hop_length"] = int(hop_length)
-
-
-def _thread_modules():
-    """Return (spec, db) modules created lazily per-thread."""
-    m = getattr(_TLS, "modules", None)
-    if m is None:
-        m = (
-            torchaudio.transforms.Spectrogram(
-                n_fft=_SHARED["n_fft"],
-                hop_length=_SHARED["hop_length"],
-                power=2.0,
-            ),
-            torchaudio.transforms.AmplitudeToDB(),
-        )
-        _TLS.modules = m
-    return m
-
-
-def _accumulate_one_chunk(audio_chunk, spec_op, to_db, hf_cut, sample_rate):
-    """Accumulate (audio + spec) running sums for a single 30 s chunk."""
-    aud64 = audio_chunk.to(torch.float64)
-    a_s = float(aud64.sum().item())
-    a_sq = float((aud64 * aud64).sum().item())
-    a_n = int(aud64.numel())
-
-    spec = to_db(spec_op(audio_chunk))
-    hz_per_bin = sample_rate / 2.0 / spec.shape[-2]
-    max_bin = int(hf_cut / hz_per_bin)
-    spec = spec[:max_bin, :]
-
-    spec64 = spec.to(torch.float64)
-    s_s = float(spec64.sum().item())
-    s_sq = float((spec64 * spec64).sum().item())
-    s_n = int(spec64.numel())
-    return a_s, a_sq, a_n, s_s, s_sq, s_n
-
-
-def _worker(task):
-    """Process one *file* (possibly with many chunk offsets).
-
-    task = (filepath, [chunk_start_sec, chunk_start_sec, ...]).
-    An empty chunk_starts list means "first max_seconds only" (legacy).
-
-    Returns the 6-tuple aggregated over all listed chunks of that file,
-    or None on failure.
+    chunk_starts: list of chunk-start times in seconds. Empty list =>
+    "first max_seconds only" (legacy manifest mode).
+    Returns 6-tuple (audio_sum, audio_sum_sq, audio_n,
+                     spec_sum,  spec_sum_sq,  spec_n)
+    or None on any load failure.
     """
-    filepath, chunk_starts = task
     try:
-        sample_rate = _SHARED["sample_rate"]
-        max_len = _SHARED["max_len"]
-        hf_cut = _SHARED["hf_cut"]
-        spec_op, to_db = _thread_modules()
+        sample_rate = cfg["sample_rate"]
+        max_len = cfg["max_len"]
+        hf_cut = cfg["hf_cut"]
 
         info = torchaudio.info(filepath)
         src_sr = info.sample_rate
         chunk_src_frames = int(max_len * src_sr / sample_rate)
         slack = int(0.1 * src_sr)
 
-        # Legacy mode: single chunk starting at 0.
         if not chunk_starts:
             chunk_starts = [0.0]
 
-        # Running sums for this file, summed over all its chunks.
         tot_a_s = tot_a_sq = 0.0; tot_a_n = 0
         tot_s_s = tot_s_sq = 0.0; tot_s_n = 0
 
@@ -147,11 +88,19 @@ def _worker(task):
                     audio, (0, max_len - audio.numel())
                 )
 
-            a_s, a_sq, a_n, s_s, s_sq, s_n = _accumulate_one_chunk(
-                audio, spec_op, to_db, hf_cut, sample_rate
-            )
-            tot_a_s += a_s; tot_a_sq += a_sq; tot_a_n += a_n
-            tot_s_s += s_s; tot_s_sq += s_sq; tot_s_n += s_n
+            aud64 = audio.to(torch.float64)
+            tot_a_s += float(aud64.sum().item())
+            tot_a_sq += float((aud64 * aud64).sum().item())
+            tot_a_n += int(aud64.numel())
+
+            spec = to_db(spec_op(audio))
+            hz_per_bin = sample_rate / 2.0 / spec.shape[-2]
+            max_bin = int(hf_cut / hz_per_bin)
+            spec = spec[:max_bin, :]
+            spec64 = spec.to(torch.float64)
+            tot_s_s += float(spec64.sum().item())
+            tot_s_sq += float((spec64 * spec64).sum().item())
+            tot_s_n += int(spec64.numel())
 
         return (tot_a_s, tot_a_sq, tot_a_n,
                 tot_s_s, tot_s_sq, tot_s_n)
@@ -175,13 +124,6 @@ def parse_args():
     p.add_argument("--hf-cut", type=int, default=16000,
                    help="Upper frequency (Hz) to keep in the spectrogram, "
                         "mirroring DeezerAmplitudeFrontend.hf_cut.")
-    p.add_argument("--num-workers", type=int,
-                   default=min(16, max(1, (os.cpu_count() or 4) - 1)),
-                   help="Number of I/O + STFT threads (not processes). "
-                        "Default caps at 16.")
-    p.add_argument("--chunksize", type=int, default=8,
-                   help="Unused (kept for CLI compatibility with the "
-                        "old ProcessPool version).")
     p.add_argument("--output", required=True)
     return p.parse_args()
 
@@ -225,7 +167,7 @@ def main():
     n_files = len(tasks)
     n_chunks_total = sum(max(1, len(s)) for _, s in tasks)
 
-    # Running sums (float64) aggregated across workers.
+    # Running sums (float64).
     audio_sum = 0.0
     audio_sum_sq = 0.0
     audio_n = 0
@@ -235,36 +177,31 @@ def main():
     n_ok_files = 0
     n_failed_files = 0
 
-    # Cap the parent's BLAS thread pool -- with N thread workers each doing
-    # STFT, we don't want each STFT internally spawning M BLAS threads.
-    torch.set_num_threads(1)
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    cfg = {
+        "sample_rate": args.sample_rate,
+        "max_len": int(args.sample_rate * args.max_seconds),
+        "hf_cut": args.hf_cut,
+    }
+    spec_op = torchaudio.transforms.Spectrogram(
+        n_fft=args.n_fft, hop_length=args.hop_length, power=2.0
+    )
+    to_db = torchaudio.transforms.AmplitudeToDB()
 
-    _pool_init(args.sample_rate, args.max_seconds,
-               args.n_fft, args.hop_length, args.hf_cut)
-
-    log.info("Processing %d files / %d chunks with %d threads ...",
-             n_files, n_chunks_total, args.num_workers)
-    try:
-        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
-            it = pool.map(_worker, tasks)
-            for res in tqdm(it, total=n_files, desc="accumulate",
-                            mininterval=0.5, smoothing=0.05):
-                if res is None:
-                    n_failed_files += 1
-                    continue
-                a_s, a_sq, a_n, s_s, s_sq, s_n = res
-                audio_sum += a_s
-                audio_sum_sq += a_sq
-                audio_n += a_n
-                spec_sum += s_s
-                spec_sum_sq += s_sq
-                spec_n += s_n
-                n_ok_files += 1
-    except KeyboardInterrupt:
-        log.warning("Interrupted by user; partial progress discarded.")
-        raise
+    log.info("Processing %d files / %d chunks ...", n_files, n_chunks_total)
+    for filepath, chunk_starts in tqdm(tasks, desc="accumulate",
+                                       mininterval=0.5):
+        res = _process_file(filepath, chunk_starts, cfg, spec_op, to_db)
+        if res is None:
+            n_failed_files += 1
+            continue
+        a_s, a_sq, a_n, s_s, s_sq, s_n = res
+        audio_sum += a_s
+        audio_sum_sq += a_sq
+        audio_n += a_n
+        spec_sum += s_s
+        spec_sum_sq += s_sq
+        spec_n += s_n
+        n_ok_files += 1
 
     if audio_n == 0 or spec_n == 0:
         log.error("No samples accumulated (n_ok_files=%d, n_failed_files=%d). "

@@ -26,13 +26,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
-import torch
 import torchaudio
 from tqdm import tqdm
 
@@ -41,20 +38,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def _duration(pair):
-    """Return (index, duration_sec_or_none) for one row.
-
-    We tag the input with an index so the caller can use `imap_unordered`
-    (which streams results as they finish, not in submission order). That
-    lets the tqdm bar tick smoothly instead of stalling on whichever file
-    happens to be slowest in the head of the queue.
-    """
-    idx, filepath = pair
+def _duration(filepath):
+    """Return duration_sec or None on any read failure."""
     try:
         info = torchaudio.info(filepath)
-        return idx, info.num_frames / info.sample_rate
+        return info.num_frames / info.sample_rate
     except Exception:
-        return idx, None
+        return None
 
 
 def parse_args():
@@ -65,13 +55,6 @@ def parse_args():
                    help="Path to write chunked manifest CSV")
     p.add_argument("--chunk-seconds", type=float, default=30.0,
                    help="Chunk length in seconds (default 30).")
-    # info() is I/O-bound so more workers than ~16 usually just add spawn +
-    # scheduling overhead. Default caps at 16 regardless of cpu_count.
-    p.add_argument("--num-workers", type=int,
-                   default=min(16, max(1, (os.cpu_count() or 4) - 1)))
-    p.add_argument("--chunksize", type=int, default=8,
-                   help="pool.imap_unordered chunksize. Small values give "
-                        "snappier progress; larger values amortise IPC.")
     p.add_argument("--filepath-col", default="filepath")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N rows (smoke test).")
@@ -95,24 +78,17 @@ def main():
         log.info("--limit set: processing first %d rows only.", len(df))
 
     filepaths = df[args.filepath_col].tolist()
-    tasks = list(enumerate(filepaths))
 
-    # Threads, not processes. torchaudio.info() is a C call that releases
-    # the GIL for the I/O and header parse. Threads share this process's
-    # already-imported torch, so there is no spawn cost, no CUDA-context
-    # deadlock, and Ctrl-C actually works.
-    torch.set_num_threads(1)  # keep the parent process quiet
-    log.info("Reading durations with %d threads ...", args.num_workers)
-    durations = [None] * len(filepaths)
-    try:
-        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
-            it = pool.map(_duration, tasks)
-            for idx, dur in tqdm(it, total=len(tasks), desc="info()",
-                                 mininterval=0.5, smoothing=0.05):
-                durations[idx] = dur
-    except KeyboardInterrupt:
-        log.warning("Interrupted by user; partial progress discarded.")
-        raise
+    log.info("Reading durations ...")
+    durations = []
+    n_fail = 0
+    for fp in tqdm(filepaths, desc="info()", mininterval=0.5):
+        d = _duration(fp)
+        durations.append(d)
+        if d is None:
+            n_fail += 1
+    if n_fail:
+        log.warning("torchaudio.info() failed on %d files.", n_fail)
 
     df["track_duration_sec"] = durations
     n_bad = df["track_duration_sec"].isna().sum()
