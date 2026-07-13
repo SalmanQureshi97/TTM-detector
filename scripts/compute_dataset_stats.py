@@ -49,6 +49,11 @@ if str(REPO_ROOT) not in sys.path:
 def _process_file(filepath, chunk_starts, cfg, spec_op, to_db):
     """Process one file and return per-file running sums over all chunks.
 
+    Decodes the file exactly ONCE (mp3 seek is fake: the decoder walks
+    from position 0 to reach frame_offset, so per-chunk loads redo the
+    same decode work). We load the whole file, resample once, and slice
+    every chunk out in memory.
+
     chunk_starts: list of chunk-start times in seconds. Empty list =>
     "first max_seconds only" (legacy manifest mode).
     Returns 6-tuple (audio_sum, audio_sum_sq, audio_n,
@@ -60,10 +65,10 @@ def _process_file(filepath, chunk_starts, cfg, spec_op, to_db):
         max_len = cfg["max_len"]
         hf_cut = cfg["hf_cut"]
 
-        info = torchaudio.info(filepath)
-        src_sr = info.sample_rate
-        chunk_src_frames = int(max_len * src_sr / sample_rate)
-        slack = int(0.1 * src_sr)
+        audio, src_sr = torchaudio.load(filepath)
+        if src_sr != sample_rate:
+            audio = torchaudio.functional.resample(audio, src_sr, sample_rate)
+        audio = audio.mean(dim=0)  # mono, shape [N_samples]
 
         if not chunk_starts:
             chunk_starts = [0.0]
@@ -72,28 +77,20 @@ def _process_file(filepath, chunk_starts, cfg, spec_op, to_db):
         tot_s_s = tot_s_sq = 0.0; tot_s_n = 0
 
         for start_sec in chunk_starts:
-            frame_offset = int(float(start_sec) * src_sr)
-            audio, sr = torchaudio.load(
-                filepath,
-                frame_offset=frame_offset,
-                num_frames=chunk_src_frames + slack,
-            )
-            if sr != sample_rate:
-                audio = torchaudio.functional.resample(audio, sr, sample_rate)
-            audio = audio.mean(dim=0)  # mono
-            if audio.numel() > max_len:
-                audio = audio[:max_len]
-            elif audio.numel() < max_len:
-                audio = torch.nn.functional.pad(
-                    audio, (0, max_len - audio.numel())
+            start = int(float(start_sec) * sample_rate)
+            end = start + max_len
+            chunk = audio[start:end]
+            if chunk.numel() < max_len:
+                chunk = torch.nn.functional.pad(
+                    chunk, (0, max_len - chunk.numel())
                 )
 
-            aud64 = audio.to(torch.float64)
+            aud64 = chunk.to(torch.float64)
             tot_a_s += float(aud64.sum().item())
             tot_a_sq += float((aud64 * aud64).sum().item())
             tot_a_n += int(aud64.numel())
 
-            spec = to_db(spec_op(audio))
+            spec = to_db(spec_op(chunk))
             hz_per_bin = sample_rate / 2.0 / spec.shape[-2]
             max_bin = int(hf_cut / hz_per_bin)
             spec = spec[:max_bin, :]
@@ -125,7 +122,29 @@ def parse_args():
                    help="Upper frequency (Hz) to keep in the spectrogram, "
                         "mirroring DeezerAmplitudeFrontend.hf_cut.")
     p.add_argument("--output", required=True)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from <output>.checkpoint.json if present.")
+    p.add_argument("--checkpoint-every", type=int, default=1000,
+                   help="Persist running sums + index after every N files "
+                        "(default 1000). Rename-atomic write so a crash "
+                        "mid-checkpoint cannot corrupt the file.")
     return p.parse_args()
+
+
+def _checkpoint_path(output_path):
+    return Path(str(output_path) + ".checkpoint.json")
+
+
+def _save_checkpoint(ckpt_path, state):
+    tmp = ckpt_path.with_suffix(ckpt_path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    tmp.replace(ckpt_path)  # atomic on posix
+
+
+def _load_checkpoint(ckpt_path):
+    with open(ckpt_path) as f:
+        return json.load(f)
 
 
 def main():
@@ -151,18 +170,23 @@ def main():
 
     # Group rows by filepath so each file is decoded exactly once, even when
     # the chunked manifest has multiple rows per file (one per chunk).
+    # Sort by filepath so the task order is fully deterministic -- required
+    # for resume to skip the right prefix on restart.
     if "chunk_start_sec" in df.columns:
         log.info("Chunked manifest detected (%d chunk rows over %d files, "
                  "avg %.2f chunks/file).",
                  len(df), df["filepath"].nunique(),
                  len(df) / max(df["filepath"].nunique(), 1))
-        grouped = (df.groupby("filepath", sort=False)["chunk_start_sec"]
+        grouped = (df.groupby("filepath", sort=True)["chunk_start_sec"]
                      .apply(lambda s: sorted(float(x) for x in s.tolist())))
         tasks = [(fp, starts) for fp, starts in grouped.items()]
     else:
         log.info("Legacy manifest (no chunk_start_sec). Using first "
                  "%.1f s of every file.", args.max_seconds)
-        tasks = [(fp, []) for fp in df["filepath"].tolist()]
+        tasks = sorted(
+            [(fp, []) for fp in df["filepath"].tolist()],
+            key=lambda t: t[0],
+        )
 
     n_files = len(tasks)
     n_chunks_total = sum(max(1, len(s)) for _, s in tasks)
@@ -176,6 +200,36 @@ def main():
     spec_n = 0
     n_ok_files = 0
     n_failed_files = 0
+    start_index = 0
+
+    out_path = Path(args.output)
+    ckpt_path = _checkpoint_path(out_path)
+
+    if args.resume and ckpt_path.exists():
+        state = _load_checkpoint(ckpt_path)
+        # Sanity check: the task-set must match what the checkpoint was
+        # written against. If someone changes the manifest or the CLI args
+        # between runs, silently resuming would produce garbage.
+        if (state.get("n_files") != n_files
+                or state.get("sample_rate") != args.sample_rate
+                or state.get("max_seconds") != args.max_seconds
+                or state.get("n_fft") != args.n_fft
+                or state.get("hop_length") != args.hop_length
+                or state.get("hf_cut") != args.hf_cut):
+            log.error("Checkpoint %s doesn't match current CLI/manifest. "
+                      "Delete it and re-run, or unset --resume.", ckpt_path)
+            return
+        audio_sum = state["audio_sum"]
+        audio_sum_sq = state["audio_sum_sq"]
+        audio_n = state["audio_n"]
+        spec_sum = state["spec_sum"]
+        spec_sum_sq = state["spec_sum_sq"]
+        spec_n = state["spec_n"]
+        n_ok_files = state["n_ok_files"]
+        n_failed_files = state["n_failed_files"]
+        start_index = state["next_index"]
+        log.info("Resuming from checkpoint: %d/%d files already done.",
+                 start_index, n_files)
 
     cfg = {
         "sample_rate": args.sample_rate,
@@ -187,21 +241,52 @@ def main():
     )
     to_db = torchaudio.transforms.AmplitudeToDB()
 
-    log.info("Processing %d files / %d chunks ...", n_files, n_chunks_total)
-    for filepath, chunk_starts in tqdm(tasks, desc="accumulate",
-                                       mininterval=0.5):
-        res = _process_file(filepath, chunk_starts, cfg, spec_op, to_db)
-        if res is None:
-            n_failed_files += 1
-            continue
-        a_s, a_sq, a_n, s_s, s_sq, s_n = res
-        audio_sum += a_s
-        audio_sum_sq += a_sq
-        audio_n += a_n
-        spec_sum += s_s
-        spec_sum_sq += s_sq
-        spec_n += s_n
-        n_ok_files += 1
+    def _write_checkpoint(next_index):
+        _save_checkpoint(ckpt_path, {
+            "n_files": n_files,
+            "sample_rate": args.sample_rate,
+            "max_seconds": args.max_seconds,
+            "n_fft": args.n_fft,
+            "hop_length": args.hop_length,
+            "hf_cut": args.hf_cut,
+            "audio_sum": audio_sum,
+            "audio_sum_sq": audio_sum_sq,
+            "audio_n": audio_n,
+            "spec_sum": spec_sum,
+            "spec_sum_sq": spec_sum_sq,
+            "spec_n": spec_n,
+            "n_ok_files": n_ok_files,
+            "n_failed_files": n_failed_files,
+            "next_index": next_index,
+        })
+
+    log.info("Processing %d files / %d chunks (starting at index %d) ...",
+             n_files, n_chunks_total, start_index)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    i = start_index  # so the KeyboardInterrupt handler can reference it
+    try:
+        for i in tqdm(range(start_index, n_files), desc="accumulate",
+                      initial=start_index, total=n_files, mininterval=0.5):
+            filepath, chunk_starts = tasks[i]
+            res = _process_file(filepath, chunk_starts, cfg, spec_op, to_db)
+            if res is None:
+                n_failed_files += 1
+            else:
+                a_s, a_sq, a_n, s_s, s_sq, s_n = res
+                audio_sum += a_s
+                audio_sum_sq += a_sq
+                audio_n += a_n
+                spec_sum += s_s
+                spec_sum_sq += s_sq
+                spec_n += s_n
+                n_ok_files += 1
+            if (i + 1) % args.checkpoint_every == 0:
+                _write_checkpoint(i + 1)
+    except KeyboardInterrupt:
+        _write_checkpoint(i + 1)
+        log.warning("Interrupted; checkpoint saved at index %d. Re-run "
+                    "with --resume to continue.", i + 1)
+        raise
 
     if audio_n == 0 or spec_n == 0:
         log.error("No samples accumulated (n_ok_files=%d, n_failed_files=%d). "
@@ -240,6 +325,10 @@ def main():
     }
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
+    # Successful full pass -- remove the checkpoint so a later --resume
+    # doesn't accidentally restart against stale state.
+    if ckpt_path.exists():
+        ckpt_path.unlink()
     log.info("Saved %s", out_path)
     log.info("  audio: mean=%.6f std=%.6f  (n=%d)", audio_mean, audio_std, audio_n)
     log.info("  spec:  mean=%.6f std=%.6f  (n=%d)", spec_mean,  spec_std,  spec_n)
