@@ -27,7 +27,7 @@ frontend:
   normalize_mean: -4.0
   normalize_std: 3.0
   # New: point at the JSON produced by scripts/compute_dataset_stats.py.
-  stats_file: outputs/dataset_stats/sonics_c1.json
+  stats_file: outputs/dataset_stats/sonics_c1_chunked.json
 
 backbone:
   type: speccnn
