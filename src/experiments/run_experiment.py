@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -49,7 +50,8 @@ def collate_batch(batch):
 
 
 def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
-                    balanced=False, balance_subset=False, max_per_class=None):
+                    balanced=False, balance_subset=False, max_per_class=None,
+                    epoch_sample_frac=None):
     ds = AudioManifestDataset(
         manifest_path=manifest,
         split=split,
@@ -73,18 +75,31 @@ def make_dataloader(manifest, split, task_cfg, datasets, runtime_cfg, shuffle,
 
     sampler = None
     if balanced:
-        sampler = make_task_balanced_sampler(ds)
+        # Optionally draw only a random balanced fraction of the data per
+        # epoch (epoch_sample_frac in (0, 1)) to shorten epochs.
+        num_samples = None
+        if epoch_sample_frac and 0 < epoch_sample_frac < 1:
+            num_samples = max(1, int(len(ds) * epoch_sample_frac))
+        sampler = make_task_balanced_sampler(ds, num_samples=num_samples)
         shuffle = False  # sampler and shuffle are mutually exclusive
-        log.info("Using balanced sampler for split=%s (%d samples)", split, len(ds))
+        log.info("Using balanced sampler for split=%s (%d samples, drawing "
+                 "%d/epoch)", split, len(ds), num_samples or len(ds))
 
-    return DataLoader(
-        ds,
+    num_workers = runtime_cfg["num_workers"]
+    loader_kwargs = dict(
         batch_size=runtime_cfg["batch_size"],
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=runtime_cfg["num_workers"],
+        num_workers=num_workers,
         collate_fn=collate_batch,
+        pin_memory=runtime_cfg.get("pin_memory", False),
     )
+    if num_workers > 0:
+        # Keep workers alive between epochs (avoids re-spawn cost) and let
+        # each prefetch several batches ahead so the GPU never waits on IO.
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = runtime_cfg.get("prefetch_factor", 4)
+    return DataLoader(ds, **loader_kwargs)
 
 
 def _save_confusion(model, loader, task_cfg, device, out_dir, split_name, max_batches=None):
@@ -135,6 +150,45 @@ def move_target_to_device(target, device):
     return target.to(device)
 
 
+def _init_wandb(runtime_cfg, model_cfg, task_cfg, experiment_cfg, out_dir, resume):
+    """Start a Weights & Biases run if enabled. Returns the run or None.
+
+    Never raises: a missing wandb install or a failed init logs a warning and
+    training continues without monitoring.
+    """
+    if not runtime_cfg.get("wandb", False):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        log.warning("wandb requested but not installed (pip install wandb); "
+                    "continuing without monitoring.")
+        return None
+    try:
+        # Deterministic id from the output dir so --resume continues the same
+        # W&B run instead of creating a new one.
+        run_id = hashlib.md5(str(out_dir).encode()).hexdigest()[:16]
+        return wandb.init(
+            project=runtime_cfg.get("wandb_project", "ttm-detector"),
+            name=f"{experiment_cfg['name']}/{model_cfg['name']}/{task_cfg['name']}",
+            id=run_id,
+            resume="allow" if resume else None,
+            config={
+                "model": model_cfg["name"],
+                "task": task_cfg["name"],
+                "experiment": experiment_cfg["name"],
+                **{k: runtime_cfg.get(k) for k in (
+                    "batch_size", "num_workers", "learning_rate", "weight_decay",
+                    "epochs", "epoch_sample_frac", "segment_seconds", "amp",
+                    "grad_accum_steps",
+                )},
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - monitoring must never kill training
+        log.warning("wandb.init failed (%s); continuing without monitoring.", e)
+        return None
+
+
 def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path,
                  resume=False):
     device = torch.device(runtime_cfg["device"] if torch.cuda.is_available() else "cpu")
@@ -159,6 +213,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         runtime_cfg=runtime_cfg,
         shuffle=True,
         balanced=use_balanced,
+        epoch_sample_frac=runtime_cfg.get("epoch_sample_frac"),
     )
     val_loader = make_dataloader(
         manifest=manifest_path,
@@ -234,6 +289,11 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
     limit_batches = runtime_cfg.get("limit_batches")  # cap steps/epoch for smoke tests; None = no cap
     start_epoch = 1
 
+    wandb_run = _init_wandb(runtime_cfg, model_cfg, task_cfg, experiment_cfg,
+                            out_dir, resume)
+    wandb_log_every = int(runtime_cfg.get("wandb_log_every", 50) or 50)
+    global_step = 0
+
     # --- Resume from last.pt (full training state) if requested ---
     last_ckpt = out_dir / "last.pt"
     if resume and last_ckpt.exists():
@@ -278,6 +338,13 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
                 scaler.update()
                 optimizer.zero_grad()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
+            global_step += 1
+            if wandb_run is not None and global_step % wandb_log_every == 0:
+                wandb_run.log(
+                    {"train/loss_step": loss.item(),
+                     "train/lr": scheduler.get_last_lr()[0]},
+                    step=global_step,
+                )
             if limit_batches and train_steps >= limit_batches:
                 break
 
@@ -320,6 +387,16 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(avg_val_loss)
         history["lr"].append(lr)
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {"epoch": epoch,
+                 "train/loss": avg_train_loss,
+                 "val/loss": avg_val_loss,
+                 "lr": lr,
+                 "epoch_time_s": elapsed},
+                step=global_step,
+            )
 
         scheduler.step()
 
@@ -364,6 +441,10 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
             break
 
     log.info("Training complete. Best val_loss=%.4f saved to %s", best_val, out_dir / "best.pt")
+
+    if wandb_run is not None:
+        wandb_run.summary["best_val_loss"] = best_val
+        wandb_run.finish()
 
     # --- Persist loss history (Req 6) ---
     with open(out_dir / "history.json", "w") as f:

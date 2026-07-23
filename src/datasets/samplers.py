@@ -57,7 +57,7 @@ def balanced_subset_indices(labels, seed=42, max_per_class=None):
     return [int(i) for i in keep]
 
 
-def make_balanced_sampler(labels):
+def make_balanced_sampler(labels, num_samples=None):
     """Create a WeightedRandomSampler that balances across all classes.
 
     Each sample is weighted by 1/count(its_class), so that every class
@@ -65,16 +65,22 @@ def make_balanced_sampler(labels):
 
     Args:
         labels: list/array of integer class labels, one per sample.
+        num_samples: how many samples to draw per epoch (with replacement).
+            Defaults to len(labels), i.e. one full-size balanced pass. Pass a
+            smaller value to draw a random balanced subset each epoch (e.g.
+            25% of the data), which shortens epochs without biasing the class
+            distribution.
 
     Returns:
-        WeightedRandomSampler with replacement, length = len(labels).
+        WeightedRandomSampler with replacement.
     """
     counts = Counter(labels)
     weights = [1.0 / counts[label] for label in labels]
-    return WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), len(weights))
+    n = int(num_samples) if num_samples is not None else len(weights)
+    return WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), n)
 
 
-def make_task_balanced_sampler(dataset):
+def make_task_balanced_sampler(dataset, num_samples=None):
     """Create a balanced sampler appropriate for the dataset's task type.
 
     For binary tasks: balances on the binary target (0/1).
@@ -84,9 +90,10 @@ def make_task_balanced_sampler(dataset):
 
     Args:
         dataset: an AudioManifestDataset instance (must have .df and .task_cfg).
+        num_samples: samples drawn per epoch (see make_balanced_sampler).
 
     Returns:
         WeightedRandomSampler.
     """
     labels = task_balance_labels(dataset.df, dataset.task_cfg["type"])
-    return make_balanced_sampler(labels)
+    return make_balanced_sampler(labels, num_samples=num_samples)

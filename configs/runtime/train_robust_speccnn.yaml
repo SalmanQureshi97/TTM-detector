@@ -1,18 +1,30 @@
 seed: 42
-batch_size: 8
-num_workers: 0
+batch_size: 32 # was 8; SpecCNN is tiny, larger batch => better GPU use
+num_workers: 8 # was 0; parallel mp3 decode + prefetch, the main speedup
+pin_memory: true # pinned host memory => faster H2D copies
+prefetch_factor: 4 # batches prefetched per worker
 epochs: 50
 device: cuda
 segment_seconds: 30
 save_dir: outputs
 grad_clip: 1.0
-early_stopping_patience: 10
+early_stopping_patience: 20 # was 10; epochs are now quarter-passes (see epoch_sample_frac)
 balanced_sampling: true
 balanced_val: true
 make_reports: true
 confusion_max_per_class: null
 limit_batches: null
 amp: false # SpecCNN at 30 s fits without AMP
+
+# --- Throughput: draw a fresh random balanced 25% of the (chunked) train
+# set each epoch instead of a full pass. Over ~4 epochs the model sees all
+# data; each epoch (and thus each validation + checkpoint) is ~4x faster.
+epoch_sample_frac: 0.25
+
+# --- Monitoring (Weights & Biases). Set wandb: false to disable. ---
+wandb: true
+wandb_project: ttm-detector
+wandb_log_every: 50 # log train loss every N optimizer steps
 
 # --- Anti-overfitting changes vs train_default.yaml ---
 learning_rate: 0.0005 # was 1e-4; matches SONICS upstream
