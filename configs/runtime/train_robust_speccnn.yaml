@@ -1,5 +1,5 @@
 seed: 42
-batch_size: 32 # was 8; SpecCNN is tiny, larger batch => better GPU use
+batch_size: 16 # was 8; 32 OOMs (first conv activation is huge at 30s/44.1kHz)
 num_workers: 8 # was 0; parallel mp3 decode + prefetch, the main speedup
 pin_memory: true # pinned host memory => faster H2D copies
 prefetch_factor: 4 # batches prefetched per worker
@@ -14,7 +14,7 @@ balanced_val: true
 make_reports: true
 confusion_max_per_class: null
 limit_batches: null
-amp: false # SpecCNN at 30 s fits without AMP
+amp: true # fp16 halves activation memory (fits batch 16 comfortably) and speeds up convs
 
 # --- Throughput: draw a fresh random balanced 25% of the (chunked) train
 # set each epoch instead of a full pass. Over ~4 epochs the model sees all
