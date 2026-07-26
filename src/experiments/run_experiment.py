@@ -340,11 +340,14 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             global_step += 1
             if wandb_run is not None and global_step % wandb_log_every == 0:
+                # No explicit step= -> wandb auto-increments its own counter,
+                # which can never go backwards. Passing a local step that
+                # resets to 0 on --resume is what triggers the "steps must be
+                # monotonically increasing" warning and drops the data.
                 wandb_run.log(
                     {"train/loss_step": loss.item(),
-                     "train/lr": scheduler.get_last_lr()[0]},
-                    step=global_step,
-                )
+                     "train/lr": scheduler.get_last_lr()[0],
+                     "global_step": global_step})
             if limit_batches and train_steps >= limit_batches:
                 break
 
@@ -394,9 +397,7 @@ def run_training(model_cfg, task_cfg, experiment_cfg, runtime_cfg, manifest_path
                  "train/loss": avg_train_loss,
                  "val/loss": avg_val_loss,
                  "lr": lr,
-                 "epoch_time_s": elapsed},
-                step=global_step,
-            )
+                 "epoch_time_s": elapsed})
 
         scheduler.step()
 
