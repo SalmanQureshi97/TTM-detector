@@ -217,6 +217,10 @@ def process_slice(manifest_df, source, split, class4, n, seed, sample_rate,
     return {
         "n_used": len(psds),
         "mean_psd": mean_psd,
+        # Per-file spectra are kept so the factorial figure can put a
+        # confidence interval around the slice mean, and so the figure can
+        # later be redrawn without decoding the audio again.
+        "psd_stack": np.stack(psds).astype(np.float32),
         "mean_spec_db": mean_spec_db,
         "hz_axis": hz_axis,
     }
@@ -253,39 +257,131 @@ def plot_psd_overlay(slices, out_path):
     plt.close(fig)
 
 
-def plot_factorial_2x2(slices, peaks_by_slice, out_path):
+def bootstrap_detrended_ci(psd_stack, sigma_bins, n_boot=1000, alpha=0.05,
+                           seed=0):
+    """Percentile confidence band for the plotted statistic.
+
+    The curve in the factorial figure is ``detrend(mean over files)``, and
+    detrending is not linear, so a standard error on the per-file spectra
+    would not be an interval on the thing that is drawn. Instead we
+    resample the files with replacement, recompute the slice mean and its
+    detrended profile for each resample, and read the interval off the
+    per-bin percentiles. That is an interval on exactly the quantity the
+    panel shows, and it answers the question the band is there to answer:
+    how much of the peak structure is a property of the slice rather than
+    of the particular clips that were sampled from it.
+    """
+    rng = np.random.default_rng(seed)
+    n = psd_stack.shape[0]
+    draws = np.empty((n_boot, psd_stack.shape[1]), dtype=np.float64)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        draws[b] = detrend(psd_stack[idx].mean(axis=0).astype(np.float64),
+                           sigma_bins)
+    lo = np.percentile(draws, 100 * alpha / 2.0, axis=0)
+    hi = np.percentile(draws, 100 * (1.0 - alpha / 2.0), axis=0)
+    return lo, hi
+
+
+def plot_factorial_2x2(slices, peaks_by_slice, out_path, sigma_bins=20,
+                       n_boot=1000):
     """2x2 panels for the FMA real / FMA enc / FMC nat / FMC enc factorial.
-    Each panel shows the slice's detrended PSD with detected peaks marked."""
+
+    Each panel shows the slice's detrended mean PSD with a 95% bootstrap
+    band over the sampled clips and the detected peaks marked. The band is
+    what tells the reader whether a narrow peak is a real property of the
+    slice or an artefact of which 500 clips happened to be drawn.
+    """
     panels = [
-        ("fma_real",          "Real, no codec (FMA real)"),
-        ("fma_real_encoded",  "Real + codec (FMA real_encoded)"),
-        ("fmc_fake_natural",  "Fake, no codec (FMC fake_natural)"),
-        ("fmc_fake_encoded",  "Fake + codec (FMC fake_encoded)"),
+        ("fma_real",          "Real, no codec", "FMA real"),
+        ("fma_real_encoded",  "Real + codec", "FMA real_encoded"),
+        ("fmc_fake_natural",  "Fake, no codec", "FMC fake_natural"),
+        ("fmc_fake_encoded",  "Fake + codec", "FMC fake_encoded"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
-    for (key, title), ax in zip(panels, axes.flat):
-        if key not in slices:
-            ax.text(0.5, 0.5, f"{key}: no data", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=11)
-            ax.set_title(title); continue
-        d = slices[key]
-        detrended = detrend(d["mean_psd"], sigma_bins=20)
-        ax.semilogy(d["hz_axis"], detrended, color="black", linewidth=0.8)
-        for f_hz, prom in peaks_by_slice.get(key, [])[:10]:
-            ax.axvline(f_hz, color="crimson", alpha=0.45, linewidth=0.9)
-            ax.text(f_hz, ax.get_ylim()[1] * 0.7,
-                    f"{int(f_hz)} Hz", fontsize=7, rotation=90,
-                    ha="right", va="top", color="crimson")
-        ax.set_title(title)
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("Detrended PSD (a.u., log scale)")
-        ax.grid(alpha=0.3)
-    fig.suptitle(
-        "2x2 factorial: which peaks are codec-attributable vs generator-attributable?",
-        fontsize=13,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+
+    ink, muted, rule, grid = "#1a1a19", "#5c5b57", "#c9c7bf", "#ebe9e3"
+    peak_col = "#e34948"
+    band_col = "#b9d0ee"
+
+    with plt.rc_context({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
+        "font.size": 8.5, "text.color": ink, "axes.linewidth": 0.7,
+        "axes.edgecolor": rule, "axes.labelcolor": muted,
+        "xtick.color": muted, "ytick.color": muted,
+    }):
+        fig, axes = plt.subplots(2, 2, figsize=(7.0, 4.6), sharex=True,
+                                 sharey=True)
+        fig.subplots_adjust(left=0.085, right=0.985, top=0.895, bottom=0.115,
+                            wspace=0.08, hspace=0.30)
+
+        drawn = []
+        for (key, title, subtitle), ax in zip(panels, axes.flat):
+            if key not in slices:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color=muted)
+                ax.set_title(title, fontsize=9, pad=5)
+                continue
+            d = slices[key]
+            khz = d["hz_axis"] / 1000.0
+            centre = detrend(d["mean_psd"], sigma_bins)
+
+            if "psd_stack" in d:
+                lo, hi = bootstrap_detrended_ci(d["psd_stack"], sigma_bins,
+                                                n_boot=n_boot)
+                ax.fill_between(khz, lo, hi, color=band_col, linewidth=0,
+                                zorder=2)
+            ax.semilogy(khz, centre, color=ink, linewidth=0.7, zorder=4)
+
+            top = peaks_by_slice.get(key, [])[:8]
+            for f_hz, _ in top:
+                ax.axvline(f_hz / 1000.0, color=peak_col, alpha=0.55,
+                           linewidth=0.7, zorder=3)
+            for rank, (f_hz, _) in enumerate(top[:3]):
+                ax.annotate(f"{f_hz / 1000.0:.1f}", xy=(f_hz / 1000.0, 1.0),
+                            xycoords=("data", "axes fraction"),
+                            xytext=(2.5, -9 - 9 * rank), textcoords="offset points",
+                            fontsize=6.6, color=peak_col, ha="left", va="top",
+                            zorder=6)
+
+            ax.set_title(f"{title}  ({subtitle}, $n$ = {d['n_used']})",
+                         fontsize=8.6, pad=5, color=ink)
+            ax.grid(True, axis="y", color=grid, linewidth=0.6)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            ax.tick_params(length=0, pad=2.5, labelsize=7.4)
+            drawn.append(centre)
+
+        if drawn:
+            stacked = np.concatenate(drawn)
+            axes[0, 0].set_ylim(max(stacked.min() * 0.85, 1e-3),
+                                stacked.max() * 1.9)
+        # The detrended axis sits close to 1, where the default log
+        # formatter's "3 x 10^0" ticks are harder to read than plain numbers.
+        for ax in axes.flat:
+            ax.yaxis.set_major_formatter(
+                matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+            ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        for ax in axes[1, :]:
+            ax.set_xlabel("frequency (kHz)", fontsize=8)
+        for ax in axes[:, 0]:
+            ax.set_ylabel("detrended PSD (log scale)", fontsize=8)
+
+        fig.legend(
+            handles=[
+                plt.Line2D([], [], color=ink, linewidth=0.9,
+                           label="mean over sampled clips"),
+                plt.Rectangle((0, 0), 1, 1, facecolor=band_col, edgecolor="none",
+                              label="95% bootstrap interval"),
+                plt.Line2D([], [], color=peak_col, linewidth=0.9,
+                           label="detected local-maxima peak"),
+            ],
+            loc="upper center", bbox_to_anchor=(0.5, 1.012), ncol=3,
+            frameon=False, fontsize=7.8, handlelength=1.6, columnspacing=2.0)
+
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        fig.savefig(Path(out_path).with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -422,6 +518,14 @@ def main():
     if not slices:
         log.error("No slices produced data -- aborting.")
         return
+
+    # --- per-file spectra, kept so the figures can be redrawn later ---------
+    np.savez_compressed(
+        out_dir / "psd_per_file.npz",
+        **{f"{name}__psd": d["psd_stack"] for name, d in slices.items()},
+        **{f"{name}__hz": d["hz_axis"] for name, d in slices.items()},
+    )
+    log.info("Saved %s", out_dir / "psd_per_file.npz")
 
     # --- overlay + factorial figures ----------------------------------------
     plot_psd_overlay(slices, out_dir / "psd_overlay.png")
