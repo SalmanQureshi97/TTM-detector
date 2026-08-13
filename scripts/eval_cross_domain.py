@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import gc
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -62,9 +63,48 @@ def parse_args():
                    help="Default: the directory the checkpoint lives in.")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--max-per-class", type=int, default=None,
+                   help="Cap the balanced validation subset at N clips per "
+                        "class. Unset scores every row, which on the chunked "
+                        "manifest is >110k clips.")
+    p.add_argument("--progress-every", type=int, default=25,
+                   help="Report progress every N batches.")
     p.add_argument("--max-batches", type=int, default=None,
                    help="Cap batches per slice. For a smoke test only.")
     return p.parse_args()
+
+
+class _Progress:
+    """Iterate a loader while reporting throughput and an ETA.
+
+    ``collect_predictions`` only ever iterates its loader, so a proxy that
+    yields batches through is enough to get progress out of a slice that
+    would otherwise print nothing for hours.
+    """
+
+    def __init__(self, loader, every):
+        self.loader = loader
+        self.every = every
+        self.total = len(loader.dataset)
+        self.dataset = loader.dataset
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        start = time.time()
+        done = 0
+        for i, batch in enumerate(self.loader, 1):
+            yield batch
+            done += len(batch["meta"])
+            if i % self.every == 0:
+                rate = done / max(time.time() - start, 1e-9)
+                eta = (self.total - done) / rate if rate else 0.0
+                print(f"\r      {done:,}/{self.total:,} "
+                      f"({100 * done / self.total:5.1f}%)  "
+                      f"{rate:6.1f} clips/s  ETA {eta / 60:5.1f} min",
+                      end="", flush=True)
+        print()
 
 
 def class4_loader(manifest, split, datasets, class4, task_cfg, runtime_cfg,
@@ -133,7 +173,8 @@ def main():
         """
         try:
             with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                _save_confusion(model, loader, task_cfg, device, out_dir, name,
+                _save_confusion(model, _Progress(loader, args.progress_every),
+                                task_cfg, device, out_dir, name,
                                 max_batches=args.max_batches)
         finally:
             it = getattr(loader, "_iterator", None)
@@ -151,6 +192,7 @@ def main():
         manifest=args.manifest, split="val", task_cfg=task_cfg,
         datasets=experiment_cfg["val_datasets"], runtime_cfg=runtime_cfg,
         shuffle=False, balance_subset=runtime_cfg.get("balanced_val", False),
+        max_per_class=args.max_per_class,
     )
     print(f"val                  n = {len(val_loader.dataset):,}")
     save(val_loader, "val")
