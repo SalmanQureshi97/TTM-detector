@@ -26,7 +26,7 @@ Example:
       --runtime configs/runtime/train_robust_speccnn.yaml \
       --manifest /home/jovyan/Thesis/Code/data/manifests/master_manifest_with_splits_chunked.csv \
       --checkpoint outputs/c1_sonics_only/deezer_speccnn_amplitude_standardised/four_class_flat_smooth/best.pt \
-      --num-workers 4 --batch-size 8
+      --num-workers 4
 """
 
 from __future__ import annotations
@@ -89,23 +89,11 @@ def main():
     experiment_cfg = load_yaml(args.experiment)
     runtime_cfg = load_yaml(args.runtime)
 
-    # make_dataloader reads these off runtime_cfg, so override them there
-    # rather than passing them down; otherwise the flags reach only the two
-    # class4 loaders below and the val/FMA/FMC-all loaders keep the training
-    # batch size.
-    if args.batch_size is not None:
-        runtime_cfg["batch_size"] = args.batch_size
-    if args.num_workers is not None:
-        runtime_cfg["num_workers"] = args.num_workers
-    batch_size = runtime_cfg["batch_size"]
-    num_workers = runtime_cfg["num_workers"]
+    batch_size = args.batch_size or runtime_cfg["batch_size"]
+    num_workers = args.num_workers if args.num_workers is not None \
+        else runtime_cfg["num_workers"]
 
     device = torch.device(runtime_cfg["device"] if torch.cuda.is_available() else "cpu")
-    # Training runs under fp16 autocast (amp in the runtime config), which is
-    # what makes its batch size fit. Evaluating in fp32 needs roughly twice
-    # the activation memory and OOMs on the first conv at 30 s / 44.1 kHz, so
-    # match the training precision here.
-    use_amp = bool(runtime_cfg.get("amp", False)) and device.type == "cuda"
     out_dir = Path(args.output_dir) if args.output_dir else Path(args.checkpoint).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,11 +106,6 @@ def main():
              if "epoch" in ckpt else ""))
     print(f"writing to {out_dir}\n")
 
-    def save(loader, name):
-        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            _save_confusion(model, loader, task_cfg, device, out_dir, name,
-                            max_batches=args.max_batches)
-
     # In-domain validation, built exactly as training builds it so the matrix
     # is comparable with the one training would have written itself.
     val_loader = make_dataloader(
@@ -131,7 +114,8 @@ def main():
         shuffle=False, balance_subset=runtime_cfg.get("balanced_val", False),
     )
     print(f"val                  n = {len(val_loader.dataset):,}")
-    save(val_loader, "val")
+    _save_confusion(model, val_loader, task_cfg, device, out_dir, "val",
+                    max_batches=args.max_batches)
 
     # Out of domain: FMA holds only real audio, FakeMusicCaps only generated.
     fma_loader = make_dataloader(
@@ -139,7 +123,8 @@ def main():
         datasets=["FMA"], runtime_cfg=runtime_cfg, shuffle=False,
     )
     print(f"fma_test             n = {len(fma_loader.dataset):,}")
-    save(fma_loader, "fma_test")
+    _save_confusion(model, fma_loader, task_cfg, device, out_dir, "fma_test",
+                    max_batches=args.max_batches)
 
     for name, class4 in [("fmc_natural_test", 2), ("fmc_encoded_test", 3)]:
         ds, loader = class4_loader(
@@ -151,14 +136,16 @@ def main():
                   f"FakeMusicCaps rows with class4_label={class4}.")
             continue
         print(f"{name:20} n = {len(ds):,}")
-        save(loader, name)
+        _save_confusion(model, loader, task_cfg, device, out_dir, name,
+                        max_batches=args.max_batches)
 
     fmc_all = make_dataloader(
         manifest=args.manifest, split="test", task_cfg=task_cfg,
         datasets=["FakeMusicCaps"], runtime_cfg=runtime_cfg, shuffle=False,
     )
     print(f"fmc_test_all         n = {len(fmc_all.dataset):,}")
-    save(fmc_all, "fmc_test_all")
+    _save_confusion(model, fmc_all, task_cfg, device, out_dir, "fmc_test_all",
+                    max_batches=args.max_batches)
 
     print("\ndone. Written:")
     for f in sorted(out_dir.glob("confusion_*.csv")):
