@@ -32,6 +32,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
@@ -106,6 +107,9 @@ def main():
     # the activation memory and OOMs on the first conv at 30 s / 44.1 kHz, so
     # match the training precision here.
     use_amp = bool(runtime_cfg.get("amp", False)) and device.type == "cuda"
+    # Pinned host memory buys faster H2D copies during training; at eval the
+    # gain is marginal and the pages are unswappable, so drop it.
+    runtime_cfg["pin_memory"] = False
     out_dir = Path(args.output_dir) if args.output_dir else Path(args.checkpoint).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,9 +123,27 @@ def main():
     print(f"writing to {out_dir}\n")
 
     def save(loader, name):
-        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            _save_confusion(model, loader, task_cfg, device, out_dir, name,
-                            max_batches=args.max_batches)
+        """Score one slice, then tear the loader down.
+
+        make_dataloader sets persistent_workers, so a loader that stays in
+        scope keeps its worker processes alive, and every worker holds its
+        own copy of the manifest dataframe. Holding all five slices at once
+        multiplies that until the host runs out of RAM, so each loader is
+        released as soon as its matrix is written.
+        """
+        try:
+            with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                _save_confusion(model, loader, task_cfg, device, out_dir, name,
+                                max_batches=args.max_batches)
+        finally:
+            it = getattr(loader, "_iterator", None)
+            if it is not None:
+                loader._iterator = None
+                del it
+            del loader
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     # In-domain validation, built exactly as training builds it so the matrix
     # is comparable with the one training would have written itself.
@@ -132,6 +154,7 @@ def main():
     )
     print(f"val                  n = {len(val_loader.dataset):,}")
     save(val_loader, "val")
+    del val_loader
 
     # Out of domain: FMA holds only real audio, FakeMusicCaps only generated.
     fma_loader = make_dataloader(
@@ -140,6 +163,7 @@ def main():
     )
     print(f"fma_test             n = {len(fma_loader.dataset):,}")
     save(fma_loader, "fma_test")
+    del fma_loader
 
     for name, class4 in [("fmc_natural_test", 2), ("fmc_encoded_test", 3)]:
         ds, loader = class4_loader(
@@ -152,6 +176,7 @@ def main():
             continue
         print(f"{name:20} n = {len(ds):,}")
         save(loader, name)
+        del loader, ds
 
     fmc_all = make_dataloader(
         manifest=args.manifest, split="test", task_cfg=task_cfg,
@@ -159,6 +184,7 @@ def main():
     )
     print(f"fmc_test_all         n = {len(fmc_all.dataset):,}")
     save(fmc_all, "fmc_test_all")
+    del fmc_all
 
     print("\ndone. Written:")
     for f in sorted(out_dir.glob("confusion_*.csv")):
